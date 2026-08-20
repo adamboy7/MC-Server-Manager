@@ -538,35 +538,41 @@ class App(tk.Tk):
         if not info:
             return
         has_backups = get_backups_dir(info).is_dir()
+        has_world = get_world_dir(info).is_dir()
+        world_state = "normal" if has_world else "disabled"
         menu = tk.Menu(self, tearoff=0)
+
         menu.add_command(label="Open Folder...", command=lambda: self._open_server_folder(info))
+        menu.add_command(
+            label="Copy Seed",
+            command=lambda: self._copy_seed(info),
+            state="normal" if info.seed is not None else "disabled",
+        )
+        menu.add_command(label="Set MOTD...", command=lambda: self._set_motd(info))
+
+        menu.add_separator()
         menu.add_command(
             label="Create Backup...",
             command=lambda: self._create_backup(info),
-            state="normal" if get_world_dir(info).is_dir() else "disabled",
+            state=world_state,
+        )
+        menu.add_command(
+            label="Export World...",
+            command=lambda: self._export_world(info),
+            state=world_state,
         )
         menu.add_command(
             label="Roll Back World...",
             command=lambda: self._open_world_rollback_dialog(info),
-            state="normal" if get_world_dir(info).is_dir() else "disabled",
+            state=world_state,
         )
         menu.add_command(
             label="Browse Backups...",
             command=lambda: self._open_backups_folder(info),
             state="normal" if has_backups else "disabled",
         )
-        menu.add_command(
-            label="Copy Seed",
-            command=lambda: self._copy_seed(info),
-            state="normal" if info.seed is not None else "disabled",
-        )
-        menu.add_command(
-            label="Export World...",
-            command=lambda: self._export_world(info),
-            state="normal" if get_world_dir(info).is_dir() else "disabled",
-        )
+
         menu.add_separator()
-        menu.add_command(label="Set MOTD...", command=lambda: self._set_motd(info))
         menu.add_command(label="Settings...", command=lambda: self._open_settings(info))
         try:
             menu.tk_popup(event.x_root, event.y_root)

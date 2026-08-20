@@ -23,18 +23,19 @@ Notes
   in level.dat (Allow Cheats, i.e. Data.allowCommands) is therefore applied
   by locating that tag's byte offset and patching it in place; see
   set_nbt_byte.
-* Type detection:
-    - "Bukkit"  : {level-name}, {level-name}_nether and {level-name}_the_end
-                  all exist side by side (the classic Bukkit/Spigot/Paper
-                  multi-world layout).
-    - "Plugins" : a top-level "plugins" folder exists.
-    - "Forge"   : a top-level "mods" folder exists.
-    - "Vanilla" : none of the above matched.
-  These are independent tags, not mutually exclusive -- a hybrid server can
-  show more than one.
-* Player roster is built from {world}/playerdata/*.dat filenames (the UUIDs
+* Platform detection names the actual server software -- Vanilla, CraftBukkit,
+  Spigot, Paper, Purpur, Fabric, Quilt, Forge, NeoForge, SpongeVanilla,
+  SpongeForge or SpongeNeo -- from two independent probes: what is installed
+  in the folder (jar manifests and loader directories) and what last ran on
+  the world (level.dat). Both are kept: when they disagree, the world was
+  moved between platforms and that is worth telling the user. See the
+  "Platform detection" section for the full signal list, and the trap list at
+  the end of it for the tempting shortcuts that are wrong.
+* Player roster is built from the world's playerdata filenames (the UUIDs
   Minecraft uses on disk), cross-referenced against usercache.json /
-  ops.json / whitelist.json for display names and operator status.
+  ops.json / whitelist.json for display names and operator status. Those
+  files moved from {world}/playerdata/ to {world}/players/data/ in 26.x, so
+  the folder is resolved rather than assumed -- see "World layout".
 * "Export World" writes the world out in the vanilla single-folder layout.
   Bukkit splits the three dimensions across {world}, {world}_nether and
   {world}_the_end; vanilla/singleplayer nests them as {world}, {world}/DIM-1
@@ -62,7 +63,7 @@ import threading
 import time
 import uuid as uuid_lib
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -222,20 +223,80 @@ class NBTReader:
                 self.skip_tag_payload(t)
         raise ValueError(f"Unknown NBT tag type: {tag_type}")
 
-    def read_root(self):
+    def read_compound_pruned(self, skip_paths: frozenset, prefix: tuple = ()):
+        """read_tag_payload(TAG_COMPOUND), except that any member whose path
+        from the root appears in skip_paths is stepped over with
+        skip_tag_payload instead of being built into Python objects.
+
+        Only compounds that actually contain a skip target are walked this
+        way; everything else falls through to the normal reader, so the
+        pruning check costs nothing on the vast majority of tags."""
+        compound = {}
+        while True:
+            t = self.read_ubyte()
+            if t == TAG_END:
+                return compound
+            name = self.read_string()
+            here = prefix + (name,)
+            if here in skip_paths:
+                self.skip_tag_payload(t)
+                continue
+            if t == TAG_COMPOUND and any(p[:len(here)] == here for p in skip_paths):
+                compound[name] = self.read_compound_pruned(skip_paths, here)
+            else:
+                compound[name] = self.read_tag_payload(t)
+
+    def read_root(self, skip_paths=()):
         t = self.read_ubyte()
         if t != TAG_COMPOUND:
             raise ValueError("Root NBT tag is not a compound")
         _root_name = self.read_string()
-        return self.read_tag_payload(TAG_COMPOUND)
+        if not skip_paths:
+            return self.read_tag_payload(TAG_COMPOUND)
+        return self.read_compound_pruned(frozenset(skip_paths))
 
 
-def load_nbt_file(path: Path) -> dict:
-    """Load a (possibly gzipped) big-endian NBT file, return the root compound dict."""
+LEVEL_DAT_BULK_SUBTREES = frozenset({
+    ("fml", "Registries"),          # modern FML (Forge 1.13+, NeoForge)
+    ("FML", "ItemData"),            # legacy FML (<=1.12)
+    ("FML", "BlockAliases"),
+    ("FML", "ItemAliases"),
+    ("FML", "BlockSubstitutions"),
+    ("FML", "ItemSubstitutions"),
+    ("FML", "BlockedItemIds"),
+})
+
+
+def load_nbt_file(path: Path, skip_paths=()) -> dict:
+    """Load a (possibly gzipped) big-endian NBT file, return the root compound
+    dict. skip_paths is an iterable of tuples naming subtrees to step over
+    rather than decode -- see LEVEL_DAT_BULK_SUBTREES."""
     raw = path.read_bytes()
     if raw[:2] == b"\x1f\x8b":
         raw = gzip.decompress(raw)
-    return NBTReader(raw).read_root()
+    return NBTReader(raw).read_root(skip_paths)
+
+
+def load_level_dat(path: Path) -> dict:
+    """level.dat's whole root compound, with the mod-loader registries pruned.
+
+    Note this is the *root*, not root["Data"]: the loader fingerprints live in
+    siblings of Data ("fml"/"FML" on Forge-family servers, "SpongeData" on
+    older SpongeForge), and they are the most reliable platform evidence a
+    world carries."""
+    return load_nbt_file(path, LEVEL_DAT_BULK_SUBTREES)
+
+
+def nbt_path(root, *keys, default=None):
+    """Walk a chain of compound keys, returning default the moment anything
+    is missing or isn't a dict. Saves every caller writing the same nested
+    isinstance/get dance against files whose shape varies by version."""
+    node = root
+    for k in keys:
+        if not isinstance(node, dict) or k not in node:
+            return default
+        node = node[k]
+    return node
 
 
 # ---------------------------------------------------------------------------
@@ -418,10 +479,55 @@ class BackupEntry:
 
 
 @dataclass
+class Platform:
+    """What a server folder is running, and how sure we are.
+
+    Filled in by detect_platform() from two independent probes -- see the
+    "Platform detection" section for what each one reads and why both are
+    kept rather than collapsed into a single answer."""
+    loader: Optional[str] = None          # "Paper", "NeoForge", "SpongeNeo", ...
+    family: str = "unknown"               # see LOADER_FAMILIES
+    mc_version: Optional[str] = None
+    loader_version: Optional[str] = None
+    # DataVersion is absent entirely before 1.9, so this is display/ordering
+    # information only -- never branch layout decisions on it (see
+    # world_paths() for why the layout is probed per-key instead).
+    data_version: Optional[int] = None
+    confidence: str = "unknown"           # certain | likely | conflict | unknown
+    install_loader: Optional[str] = None
+    world_loader: Optional[str] = None
+    evidence: list = field(default_factory=list)
+    mods_dir: Optional[Path] = None
+    plugin_dirs: list = field(default_factory=list)
+    # Mods the loader actually loaded, {mod_id: version}, straight out of
+    # level.dat. Includes jar-in-jar dependencies that have no file in mods/,
+    # so len() of this and the jar count legitimately differ.
+    loaded_mods: dict = field(default_factory=dict)
+
+    @property
+    def display_version(self) -> str:
+        if self.mc_version and self.loader_version and self.family != "bukkit":
+            return f"{self.mc_version} ({self.loader} {self.loader_version})"
+        return self.mc_version or "Unknown"
+
+    @property
+    def tags(self) -> list:
+        """Short labels for the server list's Type column."""
+        if self.loader is None:
+            return ["Unrecognised"]
+        out = [self.loader]
+        if self.confidence == "conflict" and self.world_loader:
+            out.append(f"was {self.world_loader}")
+        elif self.confidence == "likely":
+            out.append("?")
+        return out
+
+
+@dataclass
 class ServerInfo:
     path: Path
     name: str
-    tags: list
+    platform: Platform
     version: str
     last_log_date: str
     level_name: str
@@ -438,10 +544,17 @@ class ServerInfo:
     # of recomputing; they're only refreshed by a manual Rescan, which
     # replaces this ServerInfo instance entirely.
     mod_count: Optional[int] = None
+    # Jars parked as *.jar.disabled in the same folder -- still "installed"
+    # from the user's point of view, but not loaded.
+    disabled_mod_count: int = 0
     world_size_bytes: Optional[int] = None
     total_size_bytes: Optional[int] = None
     backup_size_bytes: Optional[int] = None
     sizes_computed: bool = False
+
+    @property
+    def tags(self) -> list:
+        return self.platform.tags
 
 
 # ---------------------------------------------------------------------------
@@ -611,8 +724,120 @@ def get_world_dir(info: "ServerInfo") -> Path:
     return info.path / info.level_name
 
 
+def uses_players_folder(world_dir: Path) -> bool:
+    """True for the 26.x layout, where per-player files live under
+    world/players/ instead of directly in the world folder."""
+    return (world_dir / "players").is_dir()
+
+
 def get_playerdata_dir(info: "ServerInfo") -> Path:
-    return get_world_dir(info) / "playerdata"
+    """Where this world's <uuid>.dat files live. Also the destination for
+    restores, so it resolves to the right folder even when that folder does
+    not exist yet."""
+    world_dir = get_world_dir(info)
+    if uses_players_folder(world_dir):
+        return world_dir / "players" / "data"
+    return world_dir / "playerdata"
+
+
+def get_player_advancements_dir(info: "ServerInfo") -> Path:
+    world_dir = get_world_dir(info)
+    if uses_players_folder(world_dir):
+        return world_dir / "players" / "advancements"
+    return world_dir / "advancements"
+
+
+def get_player_stats_dir(info: "ServerInfo") -> Path:
+    world_dir = get_world_dir(info)
+    if uses_players_folder(world_dir):
+        return world_dir / "players" / "stats"
+    return world_dir / "stats"
+
+
+def world_data_dirs(info: "ServerInfo") -> list:
+    """Every folder that might hold the world-level .dat files that used to
+    live inside level.dat, most authoritative first.
+
+    Three shapes, and a server can present more than one at once:
+
+      world/data/minecraft/     26.x, namespaced
+      world/data/               pre-26, and 26.x for anything unnamespaced
+      world/dimensions/minecraft/overworld/data/minecraft/
+                                Paper and its forks
+
+    That last one is the surprise. Paper keeps all three dimensions in a
+    single folder but still treats each as a separate Bukkit world, so it
+    writes a complete per-dimension data set and leaves the world-level
+    folder without the pieces vanilla puts there -- world_gen_settings.dat
+    among them. Vanilla, CraftBukkit and Spigot all write it at the world
+    level, so both locations have to be searched, per file rather than per
+    folder: on Paper the world-level folder exists, it just doesn't have the
+    file in it."""
+    world_dir = get_world_dir(info)
+    data_dir = world_dir / "data"
+    overworld = world_dir / "dimensions" / "minecraft" / "overworld" / "data"
+    return [data_dir / "minecraft", data_dir, overworld / "minecraft", overworld]
+
+
+def get_world_data_dir(info: "ServerInfo") -> Path:
+    """The primary world data folder -- first of world_data_dirs() that
+    exists, falling back to the conventional location so callers building a
+    path to write always get something sensible."""
+    for candidate in world_data_dirs(info):
+        if candidate.is_dir():
+            return candidate
+    return get_world_dir(info) / "data"
+
+
+def read_world_data_nbt(info: "ServerInfo", filename: str) -> Optional[dict]:
+    """Payload of one of the split-out world data files, e.g.
+    "world_gen_settings.dat". Each wraps its contents as
+    {"data": {...}, "DataVersion": n}; the inner compound is returned.
+    None if the file is absent everywhere, or unreadable."""
+    for folder in world_data_dirs(info):
+        path = folder / filename
+        if not path.is_file():
+            continue
+        try:
+            root = load_nbt_file(path)
+        except Exception:
+            continue
+        data = root.get("data")
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def read_world_seed(info: "ServerInfo") -> Optional[str]:
+    """The world seed, wherever this version keeps it. Returned as a string
+    because it's only ever displayed and copied -- a 64-bit seed is not
+    reliably round-trippable through anything narrower."""
+    gen = read_world_data_nbt(info, "world_gen_settings.dat")   # 26.x
+    if gen is not None and "seed" in gen:
+        return str(gen["seed"])
+    level_dat = get_level_dat_path(info)
+    if not level_dat.is_file():
+        return None
+    try:
+        data = load_level_dat(level_dat).get("Data") or {}
+    except Exception:
+        return None
+    nested = nbt_path(data, "WorldGenSettings", "seed")          # 1.16 - 1.21.10
+    if nested is not None:
+        return str(nested)
+    if "RandomSeed" in data:                                     # pre-1.16
+        return str(data["RandomSeed"])
+    return None
+
+
+def get_playerdata_dir_for_zip_match(name: str) -> bool:
+    """Whether a path inside a backup zip is a playerdata file, under either
+    layout: <world>/playerdata/<uuid>.dat or
+    <world>/players/data/<uuid>.dat."""
+    parent = Path(name).parent
+    if parent.name == "playerdata":
+        return True
+    return parent.name == "data" and parent.parent.name == "players"
 
 
 def get_banned_players_path(info: "ServerInfo") -> Path:
@@ -717,11 +942,16 @@ def get_the_end_dir(info: "ServerInfo") -> Path:
     return info.path / f"{info.level_name}_the_end"
 
 
-def is_split_world(info: "ServerInfo") -> bool:
-    """True when this server uses the Bukkit multi-folder world layout. Kept
-    separate from the "Bukkit" tag in info.tags because that tag is decided at
-    scan time and a folder could have been added/removed since; export needs
-    the state on disk right now."""
+def has_satellite_dimension_folders(info: "ServerInfo") -> bool:
+    """True when the nether and end live in sibling folders next to the
+    overworld rather than inside it.
+
+    This is a question about folder layout, not about server type, and the
+    two stopped agreeing: CraftBukkit and Spigot still split, while Paper and
+    Purpur -- every bit as much Bukkit servers -- keep all three dimensions
+    inside the one world folder. Ask platform.family for the server type;
+    ask this for what export has to do. It reads the disk each time because a
+    folder could have been added or removed since the scan."""
     return (
         get_world_dir(info).is_dir()
         and get_nether_dir(info).is_dir()
@@ -729,19 +959,50 @@ def is_split_world(info: "ServerInfo") -> bool:
     )
 
 
-def resolve_dimension_source(dim_folder: Path, dim_name: str) -> Optional[Path]:
+# Vanilla's own name for each dimension inside a single world folder, in both
+# layouts: (old DIM folder, 26.x dimensions/ path).
+DIMENSION_FOLDER_NAMES = {
+    "nether": ("DIM-1", Path("dimensions") / "minecraft" / "the_nether"),
+    "the_end": ("DIM1", Path("dimensions") / "minecraft" / "the_end"),
+}
+
+
+def world_uses_dimensions_folder(world_dir: Path) -> bool:
+    """True for the 26.x layout, where dimensions sit under
+    dimensions/minecraft/<id>/ instead of DIM-1/ and DIM1/."""
+    return (world_dir / "dimensions").is_dir()
+
+
+def dimension_export_name(world_dir: Path, dim_key: str) -> Path:
+    """Where a folded-in dimension has to land inside the exported world, in
+    whichever layout the overworld folder is already using. Mixing the two
+    would produce a world the game reads as empty."""
+    old_name, new_path = DIMENSION_FOLDER_NAMES[dim_key]
+    return new_path if world_uses_dimensions_folder(world_dir) else Path(old_name)
+
+
+def resolve_dimension_source(dim_folder: Path, dim_key: str) -> Optional[Path]:
     """Locate the payload inside one of Bukkit's satellite world folders.
 
-    Normally the folder wraps a DIM subfolder ({world}_nether/DIM-1/region/),
-    which is exactly the shape vanilla wants, so we return that. Some setups --
-    a few multiworld plugins, or a nether folder that was hand-assembled from a
-    singleplayer save -- put region/ directly at the top instead, in which case
-    the folder itself is the dimension payload. Returns None when neither shape
-    is present (an empty or unrecognised folder), so the caller can skip it
-    rather than export an empty DIM folder."""
-    inner = dim_folder / dim_name
-    if inner.is_dir():
-        return inner
+    Three shapes turn up, and all three are checked because a server can be
+    upgraded in place and end up with either:
+
+      {world}_nether/dimensions/minecraft/the_nether/region/   26.x
+      {world}_nether/DIM-1/region/                             pre-26
+      {world}_nether/region/                                   hand-assembled
+                                                               from a
+                                                               singleplayer
+                                                               save, or left
+                                                               that way by
+                                                               some multiworld
+                                                               plugins
+
+    Returns None when none of them is present, so the caller can skip the
+    folder rather than export an empty dimension."""
+    old_name, new_path = DIMENSION_FOLDER_NAMES[dim_key]
+    for candidate in (dim_folder / new_path, dim_folder / old_name):
+        if candidate.is_dir():
+            return candidate
     if (dim_folder / "region").is_dir():
         return dim_folder
     return None
@@ -792,15 +1053,20 @@ def plan_world_export(info: "ServerInfo") -> list:
             continue
         plan.append((abs_path, rel_path))
 
-    if is_split_world(info):
+    if has_satellite_dimension_folders(info):
         satellites = (
-            (get_nether_dir(info), "DIM-1"),
-            (get_the_end_dir(info), "DIM1"),
+            (get_nether_dir(info), "nether"),
+            (get_the_end_dir(info), "the_end"),
         )
-        for folder, dim_name in satellites:
-            source = resolve_dimension_source(folder, dim_name)
+        for folder, dim_key in satellites:
+            source = resolve_dimension_source(folder, dim_key)
             if source is None:
                 continue
+            # The destination name follows the overworld folder's layout, not
+            # the satellite's: exporting a 26.x nether into DIM-1/ (or a
+            # pre-26 one into dimensions/minecraft/) produces a world the
+            # game silently reads as empty.
+            dest_prefix = dimension_export_name(world_dir, dim_key)
             for abs_path, rel_path in _iter_files(source):
                 if abs_path.name in EXPORT_SKIP_FILES:
                     continue
@@ -811,7 +1077,7 @@ def plan_world_export(info: "ServerInfo") -> list:
                 # worst -- drop it. Anything deeper (DIM-1/data/…) is kept.
                 if rel_path.parent == Path(".") and abs_path.name == "level.dat":
                     continue
-                plan.append((abs_path, Path(dim_name) / rel_path))
+                plan.append((abs_path, dest_prefix / rel_path))
 
     return plan
 
@@ -892,10 +1158,9 @@ def find_uuid_entries_in_zip(zf: zipfile.ZipFile, uuid: str) -> list:
     parent folder name is checked, not the full path."""
     matches = []
     for name in zf.namelist():
-        p = Path(name)
-        if p.parent.name != "playerdata":
+        if not get_playerdata_dir_for_zip_match(name):
             continue
-        if p.name.startswith(uuid):
+        if Path(name).name.startswith(uuid):
             matches.append(name)
     return matches
 
@@ -923,14 +1188,77 @@ def compute_folder_size(path: Path) -> int:
     return total
 
 
-def count_mods(mods_dir: Path) -> int:
-    """Count .jar files directly inside a Forge mods folder (non-recursive --
-    subfolders like mods/disabled or per-modpack sideload dirs aren't mod
-    slots themselves)."""
+def count_mods(mods_dir: Path) -> tuple:
+    """(enabled, disabled) .jar counts directly inside a mods folder.
+
+    Non-recursive: subfolders like mods/disabled, mods/plugins (Sponge) or a
+    per-modpack sideload dir aren't mod slots themselves. Renaming a jar to
+    *.jar.disabled is the usual way to park a mod without deleting it, so
+    those are counted separately rather than ignored -- they're still
+    installed, just not loaded.
+
+    Note this counts *files*, which is not the same as the number of mods the
+    loader reports: jar-in-jar dependencies are bundled inside other jars and
+    have no file of their own. See Platform.loaded_mods for that figure."""
+    enabled = disabled = 0
     try:
-        return sum(1 for f in mods_dir.iterdir() if f.is_file() and f.suffix.lower() == ".jar")
+        for f in mods_dir.iterdir():
+            if not f.is_file():
+                continue
+            name = f.name.lower()
+            if name.endswith(".jar"):
+                enabled += 1
+            elif name.endswith(".jar.disabled"):
+                disabled += 1
     except OSError:
-        return 0
+        pass
+    return enabled, disabled
+
+
+def format_platform_line(info: "ServerInfo") -> str:
+    """The detail pane's "Type:" line. Kept out of the widget code so the
+    wording can be tested without a display."""
+    plat = info.platform
+    if plat.loader is None or plat.confidence == "unknown":
+        return "Type: Unrecognised"
+    text = f"Type: {plat.loader}"
+    if plat.confidence == "conflict" and plat.world_loader:
+        # The installed loader is what will run next, but this world was last
+        # opened by something else. Worth saying out loud rather than quietly
+        # picking a winner -- it's the one thing someone would want to know
+        # before starting the server on it.
+        text += f"  (world last ran on {plat.world_loader})"
+    elif plat.confidence == "likely":
+        text += "  (probable)"
+    return text
+
+
+def format_version_line(info: "ServerInfo") -> str:
+    """The detail pane's "Version:" line. Bukkit-family loader versions are a
+    whole build string ("Paper/26.1.2-74-e4e17fc (MC: 26.1.2)/...") which is
+    too long to append, and the vanilla "loader" has no version of its own."""
+    plat = info.platform
+    text = f"Version: {info.version}"
+    if plat.loader_version and plat.family not in ("bukkit", "vanilla"):
+        text += f"   {plat.loader} {plat.loader_version}"
+    return text
+
+
+def format_mods_line(info: "ServerInfo") -> Optional[str]:
+    """The detail pane's "Mods:" line, or None for servers that don't load
+    mods at all (in which case the label is hidden rather than showing 0)."""
+    plat = info.platform
+    if plat.mods_dir is None:
+        return None
+    text = f"Mods: {info.mod_count if info.mod_count is not None else 0}"
+    if info.disabled_mod_count:
+        text += f" (+{info.disabled_mod_count} disabled)"
+    if plat.loaded_mods:
+        # Higher than the jar count whenever a mod bundles its dependencies
+        # inside itself, which is normal. Both numbers are shown because they
+        # answer different questions: what's in the folder, and what ran.
+        text += f", {len(plat.loaded_mods)} loaded"
+    return text
 
 
 def format_size(num_bytes: int) -> str:
@@ -958,51 +1286,563 @@ def find_last_log_date(server_path: Path) -> str:
     return datetime.fromtimestamp(latest.stat().st_mtime).strftime("%Y-%m-%d")
 
 
+# ---------------------------------------------------------------------------
+# Platform detection
+#
+# A server folder tells two separate stories and they answer different
+# questions, so both are read and neither is allowed to silently overwrite
+# the other:
+#
+#   probe_install()  what is installed right now. Works on a server that has
+#                    never been started, and survives the world being deleted.
+#   probe_world()    what last actually ran, from level.dat. Works when the
+#                    jar has been renamed, moved or deleted, and carries the
+#                    exact loader build.
+#
+# Agreement is the confidence signal. Disagreement is real information --
+# it means the world was moved between platforms -- and is surfaced rather
+# than resolved away.
+#
+# Every rule below was checked against a folder holding one server of each
+# supported type spanning 1.7.10 to 26.2. The traps that cost the most are
+# collected in the "do not use these alone" list at the end of this block.
+# ---------------------------------------------------------------------------
+
+LOADER_FAMILIES = {
+    "Vanilla": "vanilla",
+    "CraftBukkit": "bukkit", "Spigot": "bukkit", "Paper": "bukkit",
+    "Purpur": "bukkit", "Folia": "bukkit", "Pufferfish": "bukkit", "Leaf": "bukkit",
+    "Fabric": "fabric-like", "Quilt": "fabric-like",
+    "Forge": "fml", "NeoForge": "fml",
+    "SpongeVanilla": "sponge", "SpongeForge": "sponge", "SpongeNeo": "sponge",
+}
+
+# Manifest Main-Class -> what kind of launcher this jar is. Note that Paper,
+# Purpur, Spigot and CraftBukkit all write "org.bukkit.craftbukkit.Main" into
+# META-INF/main-class, so that file cannot be used here -- only the manifest
+# attribute plus META-INF/versions.list separates them.
+JAR_MAIN_CLASS_KINDS = {
+    "net.minecraft.bundler.Main": "vanilla-bundler",
+    "net.minecraft.server.MinecraftServer": "vanilla-legacy",
+    "io.papermc.paperclip.Main": "paperclip",
+    "org.bukkit.craftbukkit.bootstrap.Main": "bukkit-bootstrap",
+    "net.fabricmc.installer.ServerLauncher": "fabric-launcher",
+    "org.quiltmc.loader.impl.launch.server.QuiltServerLauncher": "quilt-launcher",
+    "org.spongepowered.vanilla.installer.InstallerMain": "spongevanilla",
+}
+
+# Legacy Forge (<=1.12) ships no Main-Class at all -- it is launched through
+# LaunchWrapper and identifies itself with this tweaker instead. The folder
+# also contains an untouched minecraft_server.<version>.jar whose Main-Class
+# *does* look like vanilla, so this check has to be able to override.
+LEGACY_FML_TWEAKER = "cpw.mods.fml.common.launcher.FMLTweaker"
+
+# level.dat brand strings -> our loader names. Case-folded on lookup.
+WORLD_BRAND_NAMES = {
+    "vanilla": "Vanilla", "fabric": "Fabric", "quilt": "Quilt",
+    "forge": "Forge", "neoforge": "NeoForge",
+    "craftbukkit": "CraftBukkit", "spigot": "Spigot", "paper": "Paper",
+    "purpur": "Purpur", "folia": "Folia", "pufferfish": "Pufferfish", "leaf": "Leaf",
+}
+
+# Mod ids that mean a Sponge implementation is layered over an FML loader,
+# most specific first. Matched case-insensitively.
+SPONGE_MOD_IDS = (("spongeneo", "SpongeNeo"), ("spongeforge", "SpongeForge"))
+
+MAX_PROBE_JAR_BYTES = 512 * 1024 * 1024  # skip anything absurd rather than map it
+
+
+def _first_dir(parent: Path, pattern: str) -> Optional[Path]:
+    """Lowest-sorting directory matching a glob, or None. Used for the
+    single-entry version folders the loaders drop into libraries/."""
+    try:
+        return next((p for p in sorted(parent.glob(pattern)) if p.is_dir()), None)
+    except OSError:
+        return None
+
+
+def _first_file(parent: Path, pattern: str) -> Optional[Path]:
+    try:
+        return next((p for p in sorted(parent.glob(pattern)) if p.is_file()), None)
+    except OSError:
+        return None
+
+
+def _parse_properties_text(text: str) -> dict:
+    return dict(re.findall(r"^([\w.\-]+)=(.*)$", text.replace("\r", ""), re.M))
+
+
+def read_jar_markers(jar: Path) -> Optional[dict]:
+    """Everything probe_install needs from one candidate server jar.
+
+    Returns None when the file isn't a readable zip -- a half-downloaded or
+    truncated jar is a completely ordinary thing to find in a server folder
+    and must not abort the scan."""
+    try:
+        if jar.stat().st_size > MAX_PROBE_JAR_BYTES:
+            return None
+    except OSError:
+        return None
+    out = {"name": jar.name}
+    try:
+        with zipfile.ZipFile(jar) as z:
+            names = set(z.namelist())
+            if "META-INF/MANIFEST.MF" in names:
+                manifest = z.read("META-INF/MANIFEST.MF").decode("utf-8", "replace")
+                attrs = dict(re.findall(r"^([A-Za-z][A-Za-z-]*):[ \t]*(.+?)[ \t]*$",
+                                        manifest.replace("\r", ""), re.M))
+                out["main_class"] = attrs.get("Main-Class", "")
+                out["tweak_class"] = attrs.get("TweakClass", "")
+                out["spec_title"] = attrs.get("Specification-Title", "")
+            out["kind"] = JAR_MAIN_CLASS_KINDS.get(out.get("main_class", ""), "")
+            if "META-INF/versions.list" in names:
+                lines = z.read("META-INF/versions.list").decode("utf-8", "replace").split("\n")
+                first = next((l for l in lines if l.strip()), "")
+                # "<sha> <id> <path>" (tab separated) on modern bundlers,
+                # "<sha> *<file>" on the CraftBukkit/Spigot ones.
+                out["bundled_jar"] = first.replace("\t", " ").split()[-1].lstrip("*") if first else ""
+            for probe in ("version.json", "install.properties", "fmlversion.properties"):
+                if probe in names:
+                    blob = z.read(probe).decode("utf-8", "replace")
+                    out[probe] = json.loads(blob) if probe.endswith(".json") \
+                        else _parse_properties_text(blob)
+    except (OSError, zipfile.BadZipFile, KeyError, ValueError, json.JSONDecodeError):
+        return None if "kind" not in out else out
+    return out
+
+
+def _brand_from_bundled_jar(bundled: str, fallback: str) -> str:
+    """Loader name from a versions.list entry such as "26.2/purpur-26.2.jar"
+    or "spigot-26.2-R0.1-SNAPSHOT.jar". Deliberately reads the filename
+    prefix rather than testing against a fixed list, so a paperclip fork we
+    have never seen still lands on its own name instead of being reported as
+    Paper."""
+    stem = bundled.split("/")[-1]
+    prefix = stem.split("-")[0].strip()
+    if not prefix:
+        return fallback
+    return WORLD_BRAND_NAMES.get(prefix.lower(), prefix[:1].upper() + prefix[1:])
+
+
+def probe_install(server_path: Path) -> Platform:
+    """What is installed in this folder, from the filesystem and jar
+    manifests alone. Never touches the world."""
+    p = Platform()
+    ev = p.evidence
+    mods = server_path / "mods"
+
+    # 1. Sponge overlays first: SpongeNeo *is* a NeoForge install plus one mod
+    #    jar, so checking the base loader first would shadow it.
+    sponge_neo = _first_file(mods, "spongeneo-*.jar")
+    sponge_forge = _first_file(mods, "spongeforge-*.jar")
+    sponge_vanilla = _first_file(server_path, "spongevanilla-*.jar")
+
+    # 2. Modern FML bases. These directories are also what start.bat actually
+    #    invokes (via win_args.txt), and their names carry the versions.
+    neo_dir = _first_dir(server_path, "libraries/net/neoforged/neoforge/*")
+    forge_dir = _first_dir(server_path, "libraries/net/minecraftforge/forge/*")
+    if neo_dir is not None:
+        p.loader_version = neo_dir.name
+        ev.append(f"libraries/net/neoforged/neoforge/{neo_dir.name}")
+    if forge_dir is not None:
+        ev.append(f"libraries/net/minecraftforge/forge/{forge_dir.name}")
+        if "-" in forge_dir.name:
+            p.mc_version, p.loader_version = forge_dir.name.split("-", 1)
+
+    if sponge_neo is not None:
+        p.loader = "SpongeNeo"
+        ev.append(f"mods/{sponge_neo.name}")
+    elif sponge_forge is not None:
+        p.loader = "SpongeForge"
+        ev.append(f"mods/{sponge_forge.name}")
+    elif sponge_vanilla is not None:
+        p.loader = "SpongeVanilla"
+        ev.append(sponge_vanilla.name)
+    elif neo_dir is not None:
+        p.loader = "NeoForge"
+    elif forge_dir is not None:
+        p.loader = "Forge"
+
+    # 3. Quilt before Fabric: Quilt reuses Fabric's plumbing, shipping
+    #    libraries/net/fabricmc/sponge-mixin/ and running fabric-api out of
+    #    mods/. Only the fabric-loader artifact is Fabric-specific.
+    if p.loader is None:
+        quilt_loader = _first_dir(server_path, "libraries/org/quiltmc/quilt-loader/*")
+        fabric_loader = _first_dir(server_path, "libraries/net/fabricmc/fabric-loader/*")
+        if quilt_loader is not None or (server_path / "quilt-server-launch.jar").is_file():
+            p.loader = "Quilt"
+            if quilt_loader is not None:
+                p.loader_version = quilt_loader.name
+                ev.append(f"libraries/org/quiltmc/quilt-loader/{quilt_loader.name}")
+            else:
+                ev.append("quilt-server-launch.jar")
+        elif (fabric_loader is not None or (server_path / ".fabric").is_dir()
+                or (server_path / "fabric-server-launch.jar").is_file()):
+            p.loader = "Fabric"
+            if fabric_loader is not None:
+                p.loader_version = fabric_loader.name
+                ev.append(f"libraries/net/fabricmc/fabric-loader/{fabric_loader.name}")
+            else:
+                ev.append(".fabric/ or fabric-server-launch.jar")
+
+    # 4. Root jars. Six platforms ship a file literally called server.jar, so
+    #    the filename is worthless and the manifest is everything.
+    try:
+        root_jars = sorted(j for j in server_path.glob("*.jar") if j.is_file())
+    except OSError:
+        root_jars = []
+    for jar in root_jars:
+        info = read_jar_markers(jar)
+        if info is None:
+            continue
+        kind = info.get("kind", "")
+        bundled = info.get("bundled_jar", "")
+        if kind == "fabric-launcher":
+            p.loader = p.loader or "Fabric"
+            props = info.get("install.properties", {})
+            p.mc_version = p.mc_version or props.get("game-version")
+            p.loader_version = p.loader_version or props.get("fabric-loader-version")
+            ev.append(f"{jar.name}: Fabric installer launcher")
+        elif kind == "quilt-launcher":
+            p.loader = p.loader or "Quilt"
+            ev.append(f"{jar.name}: Quilt server launcher")
+        elif kind == "spongevanilla":
+            p.loader = "SpongeVanilla"
+            ev.append(f"{jar.name}: {info.get('spec_title', 'SpongeVanilla')}")
+        elif kind == "paperclip":
+            p.loader = p.loader or _brand_from_bundled_jar(bundled, "Paper")
+            ev.append(f"{jar.name}: paperclip -> {bundled or '?'}")
+        elif kind == "bukkit-bootstrap":
+            p.loader = p.loader or _brand_from_bundled_jar(bundled, "CraftBukkit")
+            ev.append(f"{jar.name}: bukkit bootstrap -> {bundled or '?'}")
+        elif kind in ("vanilla-bundler", "vanilla-legacy"):
+            if p.loader is None:
+                p.loader = "Vanilla"
+            ev.append(f"{jar.name}: {kind}")
+            if kind == "vanilla-legacy" and not p.mc_version:
+                m = re.match(r"minecraft_server[._](.+)\.jar$", jar.name)
+                if m:
+                    p.mc_version = m.group(1)
+
+        # Legacy Forge has no Main-Class, only the tweaker -- and it sits in
+        # the same folder as an untouched vanilla server jar, so this must be
+        # able to override a "Vanilla" verdict reached a few lines above.
+        if info.get("tweak_class") == LEGACY_FML_TWEAKER:
+            p.loader = "Forge"
+            fml_props = info.get("fmlversion.properties", {})
+            p.mc_version = fml_props.get("fmlbuild.mcversion") or p.mc_version
+            m = re.match(r"forge-.+?-(\d+\.\d+[\w.]*)-.*universal\.jar$", jar.name)
+            if m:
+                p.loader_version = p.loader_version or m.group(1)
+            ev.append(f"{jar.name}: TweakClass {LEGACY_FML_TWEAKER}")
+
+        # version.json is only a Minecraft version on a genuine vanilla
+        # bundle. Legacy Forge's universal jar carries a launcher profile
+        # whose id is "1.7.10-Forge10.13.4.1614-1.7.10"; taking that as the
+        # game version puts the whole string in the version column.
+        version_json = info.get("version.json")
+        if version_json and not p.mc_version and kind in ("vanilla-bundler", "paperclip"):
+            p.mc_version = version_json.get("id")
+
+    # 5. Config fallback for a folder whose jar has been deleted. Strictly
+    #    most-specific-first: every fork also ships its ancestors' files, so
+    #    Purpur has purpur.yml *and* paper-global.yml *and* spigot.yml *and*
+    #    bukkit.yml.
+    if p.loader is None:
+        for marker, name in (
+            ("purpur.yml", "Purpur"),
+            ("config/paper-global.yml", "Paper"),
+            ("spigot.yml", "Spigot"),
+            ("bukkit.yml", "CraftBukkit"),
+            ("config/fml.toml", "Forge"),
+            ("config/forge.cfg", "Forge"),
+        ):
+            if (server_path / marker).is_file():
+                p.loader = name
+                ev.append(marker)
+                break
+
+    if (server_path / "config" / "sponge").is_dir():
+        # Corroboration only -- it outlives an uninstall, so it never gets to
+        # decide on its own.
+        ev.append("config/sponge/")
+
+    p.family = LOADER_FAMILIES.get(p.loader or "", "unknown")
+    p.install_loader = p.loader
+    return p
+
+
+def probe_world(level_dat: Path) -> Platform:
+    """What last ran on this world, from level.dat."""
+    p = Platform()
+    ev = p.evidence
+    if not level_dat.is_file():
+        ev.append("no level.dat")
+        return p
+    try:
+        root = load_level_dat(level_dat)
+    except Exception as e:
+        # A damaged level.dat can fail out of gzip, zlib or struct in a
+        # dozen ways; callers only need to know there's no answer here.
+        ev.append(f"level.dat unreadable ({e})")
+        return p
+
+    data = root.get("Data") or {}
+    version = data.get("Version") or {}
+    p.mc_version = version.get("Name") if isinstance(version, dict) else None
+    dv = data.get("DataVersion")
+    p.data_version = dv if isinstance(dv, int) else None
+
+    # 1. The mod list, which is a sibling of Data rather than inside it.
+    #    Modern FML writes root["fml"]["LoadingModList"]; FML up to 1.12
+    #    wrote root["FML"]["ModList"] with capitalised ids ("Forge", "FML")
+    #    and no "minecraft" entry at all -- hence the case fold.
+    mod_entries = (nbt_path(root, "fml", "LoadingModList", default=[])
+                   or nbt_path(root, "FML", "ModList", default=[]) or [])
+    for entry in mod_entries:
+        if isinstance(entry, dict) and entry.get("ModId"):
+            p.loaded_mods[str(entry["ModId"]).lower()] = entry.get("ModVersion")
+    if p.loaded_mods:
+        ev.append(f"level.dat mod list ({len(p.loaded_mods)} entries)")
+        for mod_id, name in SPONGE_MOD_IDS:
+            if mod_id in p.loaded_mods:
+                p.loader, p.loader_version = name, p.loaded_mods[mod_id]
+                break
+        else:
+            for mod_id, name in (("neoforge", "NeoForge"), ("forge", "Forge")):
+                if mod_id in p.loaded_mods:
+                    p.loader, p.loader_version = name, p.loaded_mods[mod_id]
+                    break
+    if "Forge" in root:
+        ev.append("root Forge compound (legacy)")
+    if "SpongeData" in root:
+        ev.append("root SpongeData compound")
+
+    # 2. Bukkit stamps its exact build into the world.
+    bukkit_version = data.get("Bukkit.Version")
+    if isinstance(bukkit_version, str) and bukkit_version and p.loader is None:
+        brand = bukkit_version.split("/")[0]
+        p.loader = WORLD_BRAND_NAMES.get(brand.lower(), brand)
+        p.loader_version = bukkit_version
+        ev.append(f"Bukkit.Version = {bukkit_version}")
+
+    # 3. Enabled datapacks. This is the only thing in level.dat that
+    #    identifies SpongeVanilla, which otherwise looks exactly like an
+    #    unmodded server (see the ServerBrands note below).
+    enabled = [str(x) for x in (nbt_path(data, "DataPacks", "Enabled", default=[]) or [])]
+    if enabled:
+        ev.append(f"DataPacks.Enabled = {enabled}")
+    if p.loader is None:
+        if "plugin-spongevanilla" in enabled:
+            p.loader = "SpongeVanilla"
+        elif any(x.startswith("plugin-sponge") for x in enabled):
+            # Some Sponge implementation, but the datapack names don't say
+            # which. Record the family and let the install probe name it.
+            p.family = "sponge"
+            ev.append("Sponge datapacks, implementation not named")
+        elif "fabric" in enabled:
+            p.loader = "Fabric"
+        elif "quilt" in enabled:
+            p.loader = "Quilt"
+        elif "paper" in enabled:
+            p.loader = "Paper"
+        elif "mod_data" in enabled or any(x.startswith("mod:") for x in enabled):
+            # 26.x FML writes "mod_data" whether it's Forge or NeoForge, so
+            # this narrows to the family and nothing more.
+            p.loader = None
+            p.family = "fml"
+            ev.append("FML-family datapacks, loader not distinguishable from datapacks alone")
+        elif "file/bukkit" in enabled:
+            p.loader = "CraftBukkit"
+
+    # 4. Brands. Weakest signal of the four, for three separate reasons:
+    #    it accumulates across every server that ever opened the world (so a
+    #    Spigot world later run on Paper lists both); 26.x Sponge writes an
+    #    empty list; and it doesn't exist at all before 1.13.
+    brands = [str(b) for b in (data.get("ServerBrands") or []) if str(b)]
+    if brands:
+        ev.append(f"ServerBrands = {brands}")
+    if p.loader is None and brands:
+        p.loader = WORLD_BRAND_NAMES.get(brands[-1].lower(), brands[-1])
+
+    # 5. Residue, for worlds too old or too sparse for anything above.
+    if p.loader is None:
+        if "forgeLifecycle" in data:
+            p.family = "fml"
+            ev.append("Data.forgeLifecycle")
+        elif p.family == "unknown" and data:
+            p.loader = "Vanilla"
+
+    if p.loader:
+        p.family = LOADER_FAMILIES.get(p.loader, p.family)
+    p.world_loader = p.loader
+    return p
+
+
+def detect_platform(server_path: Path, level_name: str) -> Platform:
+    """Run both probes and reconcile them."""
+    install = probe_install(server_path)
+    world = probe_world(server_path / level_name / "level.dat")
+
+    p = install
+    p.world_loader = world.world_loader
+    p.data_version = world.data_version
+    p.loaded_mods = world.loaded_mods
+    p.evidence = [f"install: {e}" for e in install.evidence] + \
+                 [f"world: {e}" for e in world.evidence]
+
+    if install.install_loader and world.world_loader:
+        p.confidence = "certain" if install.install_loader == world.world_loader else "conflict"
+    elif install.install_loader or world.world_loader:
+        p.confidence = "likely"
+    else:
+        p.confidence = "unknown"
+
+    # The install answer wins a conflict because it describes what will run
+    # next; the world answer is kept on world_loader and surfaced in the UI,
+    # since "this world last ran on something else" is exactly the warning
+    # someone wants before starting the server.
+    if p.loader is None:
+        p.loader = world.world_loader
+        p.family = world.family if world.family != "unknown" else p.family
+    if not p.mc_version:
+        p.mc_version = world.mc_version
+    if not p.loader_version:
+        p.loader_version = world.loader_version
+    if p.family == "unknown" and p.loader:
+        p.family = LOADER_FAMILIES.get(p.loader, "unknown")
+
+    mods_dir = server_path / "mods"
+    # SpongeVanilla is deliberately excluded: it has a mods/ folder, but only
+    # as the container for mods/plugins -- it loads no mods, so reporting a
+    # mod count for it would be answering a question it doesn't have.
+    if p.family in ("fml", "fabric-like") or p.loader in ("SpongeForge", "SpongeNeo"):
+        p.mods_dir = mods_dir if mods_dir.is_dir() else None
+    if p.family == "bukkit":
+        plugins = server_path / "plugins"
+        p.plugin_dirs = [plugins] if plugins.is_dir() else []
+    elif p.family == "sponge":
+        p.plugin_dirs = sponge_plugin_dirs(server_path)
+
+    return p
+
+
+def sponge_plugin_dirs(server_path: Path) -> list:
+    """Where a Sponge server keeps its plugins.
+
+    Sponge ships an empty top-level plugins/ folder and puts the real one at
+    mods/plugins/ -- but that path is configurable, and config/sponge/
+    launch.properties records where it actually is, so read that when it
+    exists. The top-level folder is included only if somebody has actually
+    put something in it."""
+    configured = None
+    launch_props = server_path / "config" / "sponge" / "launch.properties"
+    if launch_props.is_file():
+        try:
+            props = _parse_properties_text(
+                launch_props.read_text(encoding="utf-8", errors="replace"))
+            raw = props.get("additional-plugins-directory", "")
+            if raw:
+                rel = (raw.replace("${MODS_DIR}", "mods")
+                          .replace("${BASE_DIR}", ".").strip())
+                candidate = (server_path / rel).resolve()
+                if candidate.is_dir():
+                    configured = candidate
+        except (OSError, ValueError):
+            configured = None
+    dirs = []
+    seen = set()
+
+    def add(d: Optional[Path]):
+        # Compare resolved paths: the configured directory comes back
+        # absolute from launch.properties while the default is built by
+        # joining, and the two are usually the same folder.
+        if d is None or not d.is_dir():
+            return
+        try:
+            key = d.resolve()
+        except OSError:
+            key = d
+        if key in seen:
+            return
+        seen.add(key)
+        dirs.append(d)
+
+    add(configured)
+    add(server_path / "mods" / "plugins")
+    top = server_path / "plugins"
+    try:
+        # Sponge ships an empty top-level plugins/ folder that is not where
+        # its plugins go; only surface it if somebody has actually used it.
+        if top.is_dir() and any(top.iterdir()):
+            add(top)
+    except OSError:
+        pass
+    return dirs
+
+
+# Signals that look decisive and are not. Every one of these is wrong for at
+# least one real server type, so none of them appears above on its own:
+#
+#   mods/ exists                -> Forge      (Fabric, Quilt and Sponge use it;
+#                                              Forge and NeoForge often leave
+#                                              it empty)
+#   plugins/ exists             -> Bukkit     (SpongeVanilla and SpongeForge
+#                                              ship an empty one)
+#   world + _nether + _the_end  -> Bukkit     (Paper and Purpur stopped
+#                                              splitting; CraftBukkit and
+#                                              Spigot still do)
+#   the world folder is "world" -> always     (server.properties level-name
+#                                              wins, and a stale world/ next
+#                                              to the real one parses fine)
+#   libraries/net/fabricmc/     -> Fabric     (Quilt ships sponge-mixin there)
+#   mods/fabric-api-*.jar       -> Fabric     (Quilt runs Fabric API)
+#   file/bukkit datapack        -> Bukkit     (Purpur 26.2 doesn't have it)
+#   mod_data datapack           -> NeoForge   (plain Forge writes it too)
+#   WasModded                   -> modded     (0 on 26.x Sponge, absent <1.13)
+#   ServerBrands[0]             -> platform   (accumulates; empty on 26.x
+#                                              Sponge; absent before 1.13)
+#   root jar filename           -> platform   (six platforms use server.jar)
+#   META-INF/main-class         -> platform   (Paper writes CraftBukkit's)
+#   a jar's version.json id     -> mc version (legacy Forge's is a profile id)
+#   a server jar has Main-Class -> always     (legacy Forge has only TweakClass)
+#   config/fml.toml             -> Forge      (NeoForge and SpongeNeo too)
+#   Data.version                -> mc version (it's the anvil format id, 19133
+#                                              on every version we support)
+#   DataVersion is present      -> always     (absent before 1.9)
+#   mods/*.jar count            -> mods loaded (jar-in-jar deps have no file)
+
+
 def detect_server(server_path: Path) -> ServerInfo:
     props = read_server_properties(server_path)
     level_name = props.get("level-name", "world")
     difficulty = parse_difficulty(props)
 
     world_dir = server_path / level_name
-    nether_dir = server_path / f"{level_name}_nether"
-    end_dir = server_path / f"{level_name}_the_end"
 
-    tags = []
-    if world_dir.exists() and nether_dir.exists() and end_dir.exists():
-        tags.append("Bukkit")
-    if (server_path / "plugins").is_dir():
-        tags.append("Plugins")
-    if (server_path / "mods").is_dir():
-        tags.append("Forge")
-    if not tags:
-        tags.append("Vanilla")
+    platform = detect_platform(server_path, level_name)
 
-    mod_count = count_mods(server_path / "mods") if "Forge" in tags else None
+    mod_count = disabled_mod_count = None
+    if platform.mods_dir is not None:
+        mod_count, disabled_mod_count = count_mods(platform.mods_dir)
+
     last_log_date = find_last_log_date(server_path)
 
-    version = "Unknown"
-    seed = None
+    # Version comes from the platform probes, which read the game version out
+    # of level.dat when the world has been generated and out of the installed
+    # jar when it hasn't. Note there is deliberately no fall back to
+    # Data.version: that tag is the anvil *format* id (19133 on every version
+    # from 1.7.10 to 26.2), not a game version, and displaying it produced a
+    # confident-looking "DataVersion 19133" for anything predating 1.9.
     level_dat = world_dir / "level.dat"
-    if level_dat.exists():
-        try:
-            root = load_nbt_file(level_dat)
-            d = root.get("Data", {})
-            ver = d.get("Version")
-            if isinstance(ver, dict) and "Name" in ver:
-                version = str(ver["Name"])
-            elif "version" in d:
-                version = f"DataVersion {d['version']}"
-            # 1.16+ nests the seed under WorldGenSettings; older versions
-            # keep it as a top-level RandomSeed tag.
-            wgs = d.get("WorldGenSettings")
-            if isinstance(wgs, dict) and "seed" in wgs:
-                seed = str(wgs["seed"])
-            elif "RandomSeed" in d:
-                seed = str(d["RandomSeed"])
-        except Exception:
-            version = "Unreadable"
-    else:
+    if platform.mc_version:
+        version = platform.mc_version
+    elif not level_dat.exists():
         version = "No level.dat"
+    elif any("unreadable" in e for e in platform.evidence):
+        version = "Unreadable"
+    else:
+        version = "Unknown"
 
     icon_path = None
     for candidate in (server_path / "server-icon.png", world_dir / "icon.png"):
@@ -1010,10 +1850,31 @@ def detect_server(server_path: Path) -> ServerInfo:
             icon_path = candidate
             break
 
+    info = ServerInfo(
+        path=server_path,
+        name=server_path.name,
+        platform=platform,
+        version=version,
+        last_log_date=last_log_date,
+        level_name=level_name,
+        icon_path=icon_path,
+        players=[],
+        motd=props.get("motd", ""),
+        seed=None,
+        difficulty=difficulty,
+        mod_count=mod_count,
+        disabled_mod_count=disabled_mod_count or 0,
+    )
+
+    # Both of these need the resolved world folder, so they run against the
+    # ServerInfo rather than re-deriving the paths here. They also need to
+    # cope with either world layout -- see the "World layout" section.
+    info.seed = read_world_seed(info)
+
     names, ops, banned, whitelisted = load_name_map(server_path)
 
     players = []
-    playerdata_dir = world_dir / "playerdata"
+    playerdata_dir = get_playerdata_dir(info)
     if playerdata_dir.is_dir():
         for dat in sorted(playerdata_dir.glob("*.dat")):
             u = dat.stem
@@ -1034,25 +1895,20 @@ def detect_server(server_path: Path) -> ServerInfo:
                 is_whitelisted=key in whitelisted,
             ))
 
-    return ServerInfo(
-        path=server_path,
-        name=server_path.name,
-        tags=tags,
-        version=version,
-        last_log_date=last_log_date,
-        level_name=level_name,
-        icon_path=icon_path,
-        players=players,
-        motd=props.get("motd", ""),
-        seed=seed,
-        difficulty=difficulty,
-        mod_count=mod_count,
-    )
+    info.players = players
+    return info
 
 
 def looks_like_server_folder(path: Path) -> bool:
     if (path / "server.properties").exists() or (path / "eula.txt").exists():
         return True
+    # A root *.jar is not a reliable marker on its own: NeoForge and SpongeNeo
+    # install no jar at the top level at all, launching out of libraries/
+    # instead. Check for the loader directories those leave behind as well.
+    for marker in ("libraries/net/neoforged/neoforge", "libraries/net/minecraftforge/forge",
+                   "libraries/net/fabricmc/fabric-loader", "libraries/org/quiltmc/quilt-loader"):
+        if (path / marker).is_dir():
+            return True
     try:
         return any(path.glob("*.jar"))
     except OSError:
@@ -1307,8 +2163,9 @@ class App(tk.Tk):
         self.version_label = ttk.Label(details, text="")
         self.version_label.pack(anchor="w")
         self.mods_label = ttk.Label(details, text="")
-        # Not packed here -- only shown for Forge servers (tags contains
-        # "Forge"); on_select_server() toggles it with .pack()/.pack_forget().
+        # Not packed here -- only shown for servers that have a mods folder
+        # (platform.mods_dir); on_select_server() toggles it with
+        # .pack()/.pack_forget().
         self.path_label = ttk.Label(details, text="", foreground="#666666")
         self.path_label.pack(anchor="w")
 
@@ -1584,7 +2441,7 @@ class App(tk.Tk):
             messagebox.showwarning("World Not Found", f"{world_dir} no longer exists.")
             return
 
-        split = is_split_world(info)
+        split = has_satellite_dimension_folders(info)
         parent = filedialog.askdirectory(
             title=f"Export {info.level_name} to folder...",
             mustexist=True,
@@ -1987,13 +2844,15 @@ class App(tk.Tk):
             self.motd_label.pack(anchor="w", pady=(2, 4), before=self.preview_frame)
         else:
             self.motd_label.pack_forget()
-        self.tags_label.config(text="Type: " + ", ".join(info.tags))
-        self.version_label.config(text=f"Version: {info.version}")
-        if "Forge" in info.tags:
-            self.mods_label.config(text=f"Mods: {info.mod_count if info.mod_count is not None else 0}")
-            self.mods_label.pack(anchor="w", after=self.version_label)
-        else:
+        self.tags_label.config(text=format_platform_line(info))
+        self.version_label.config(text=format_version_line(info))
+
+        mods_text = format_mods_line(info)
+        if mods_text is None:
             self.mods_label.pack_forget()
+        else:
+            self.mods_label.config(text=mods_text)
+            self.mods_label.pack(anchor="w", after=self.version_label)
         self.path_label.config(text=str(info.path))
 
         world_dir = get_world_dir(info)

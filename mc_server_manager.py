@@ -62,9 +62,10 @@ import subprocess
 import threading
 import time
 import uuid as uuid_lib
+import tarfile
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -470,12 +471,6 @@ class PlayerInfo:
     is_banned: bool = False
     ban_reason: Optional[str] = None
     is_whitelisted: bool = False
-
-
-@dataclass
-class BackupEntry:
-    path: Path
-    dt: Optional[datetime]  # None if the filename didn't match the expected pattern
 
 
 @dataclass
@@ -1019,8 +1014,11 @@ def get_backups_dir(info: "ServerInfo") -> Path:
 def get_world_backups_dir(info: "ServerInfo") -> Path:
     """The folder that actually holds this world's dated backup archives --
     prefer the world-specific subfolder if present, falling back to the
-    top-level backups folder otherwise (same layout Browse Backups... has
-    always assumed)."""
+    top-level backups folder otherwise.
+
+    That preference turns out to be right for a reason this predates: both
+    AromaBackup generations write into backups/{level_name}/. Browse
+    Backups... opens whatever this returns."""
     backups_dir = get_backups_dir(info)
     world_backups_dir = backups_dir / info.level_name
     return world_backups_dir if world_backups_dir.is_dir() else backups_dir
@@ -1218,60 +1216,1082 @@ def export_world(plan: list, dest: Path, progress_cb=None, cancel_event=None) ->
     return bytes_done
 
 
-BACKUP_FILENAME_RE_TEMPLATE = r"^Backup--{level_name}--(\d{{4}}-\d{{2}}-\d{{2}}--\d{{2}}-\d{{2}})\.zip$"
-BACKUP_DATE_FORMAT = "%Y-%m-%d--%H-%M"
+# ---------------------------------------------------------------------------
+# Backups
+#
+# A server's backups are whatever its tooling made them, and six mutually
+# incompatible systems turn up in practice. They disagree about the output
+# folder, the filename, whether the world sits at the archive root or one
+# level down, and even about which character separates path components.
+#
+#   AromaBackup 3.x   backups/{level}/Backup--{world}--{Y-m-d--H-M}.zip
+#                     + a .backupinfo sidecar; world at the archive root
+#   AromaBackup 0.x   backups/{level}/{Y}/{M}/{D}/Backup-{world}-{Y}-{M}-{D}--{H}-{M}.zip
+#                     + a shared backupstore.txt; world nested under {level}/
+#   AutoBackup        backups/{folder}_{Y-m-d}_{H-M-S}.zip, ONE PER WORLD
+#                     FOLDER, world at the root, BACKSLASH separators
+#   SimpleBackups     simplebackups/{folder}_{Y-m-d}_{H-M-S}.zip, world
+#                     nested under {folder}/
+#   x-backup          a content-addressed blob store + SQLite index
+#   ServerBackup      an uncompressed directory tree
+#
+# Two consequences shape everything below. First, a split (Bukkit) world is
+# backed up as several archives sharing one timestamp, so the unit the user
+# picks from is a *set*, not a file. Second, the archive's own layout has to
+# be probed rather than inferred from its name -- two providers share a
+# filename grammar and disagree about the contents.
+# ---------------------------------------------------------------------------
+
+# Aroma 3.x. This was the app's only pattern historically, and it is correct
+# for that provider -- it just never matched the other nine archives.
+AROMA3_ARCHIVE_RE = re.compile(
+    r"^Backup--(?P<name>.+)--(?P<stamp>\d{4}-\d{2}-\d{2}--\d{2}-\d{2})"
+    r"\.(?P<ext>zip|tar|tar\.gz)$"
+)
+AROMA3_DATE_FORMAT = "%Y-%m-%d--%H-%M"
+BACKUP_DATE_FORMAT = AROMA3_DATE_FORMAT  # kept: other modules may import it
+
+# AutoBackup and SimpleBackups. Anchored on the stamp because the world name
+# is variable-length and "world" is a prefix of "world_nether" -- matching
+# "^{level}_(.*)" on world_nether_2026-08-19_17-00-39.zip yields the useless
+# "nether_2026-08-19_17-00-39".
+DATED_ARCHIVE_RE = re.compile(
+    r"^(?P<name>.+)_(?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{2}-\d{2}-\d{2})\.zip$"
+)
+
+# Aroma 0.x: single hyphens, unpadded month/day, and level names that contain
+# hyphens and spaces. The negative lookarounds matter: without them this also
+# matches every Aroma 3.x name, capturing "-world-" from
+# "Backup--world--2026-08-20--10-23.zip", because the greedy .* absorbs 3.x's
+# doubled hyphens and \d{1,2} accepts zero-padded fields. 3.x is also tried
+# first, so this is belt and braces.
+AROMA0_ARCHIVE_RE = re.compile(
+    r"^Backup-(?P<name>(?!-).*[^-])-(?P<y>\d{4})-(?P<mo>\d{1,2})-(?P<d>\d{1,2})"
+    r"--(?P<h>\d{1,2})-(?P<mi>\d{1,2})\.zip$"
+)
+
+# Aroma's own scratch directory, and the manifest it puts inside archives.
+AROMA_MANIFEST_NAME = "incremental.aromabackup"
+
+BACKUP_PROVIDER_NAMES = {
+    "mcsm-safety": "Safety backup (ours)",
+    "aroma3": "AromaBackup",
+    "aroma0": "AromaBackup (legacy)",
+    "autobackup": "AutoBackup",
+    "simplebackups": "SimpleBackups",
+    "xbackup": "x-backup",
+    "serverbackup": "ServerBackup",
+    "unknown": "Unrecognised",
+}
+
+# Providers whose archives we can read well enough to restore from.
+RESTORABLE_PROVIDERS = {"mcsm-safety", "aroma3", "aroma0", "autobackup",
+                        "simplebackups", "unknown"}
 
 
-def parse_backup_filename(fname: str, level_name: str) -> Optional[datetime]:
-    """Parse the date out of a "Backup--{level_name}--{date}.zip" filename,
-    e.g. "Backup--Madlands--2024-01-16--21-59.zip". Returns None if the
-    filename doesn't match that pattern (e.g. a renamed/manual backup)."""
-    pattern = BACKUP_FILENAME_RE_TEMPLATE.format(level_name=re.escape(level_name))
-    m = re.match(pattern, fname)
+@dataclass
+class ParsedBackupName:
+    world: str
+    dt: Optional[datetime]
+    stamp: str        # the grouping key -- the raw stamp text, not the datetime
+    provider: str
+
+
+def parse_backup_filename(fname: str, level_name: str = "") -> Optional[datetime]:
+    """Date encoded in a backup archive's filename, or None.
+
+    Kept as a thin wrapper over parse_backup_archive_name for callers that
+    only want the timestamp. level_name is accepted and ignored -- every
+    pattern anchors on the stamp rather than on the world name, which is what
+    lets "world_nether_..." parse correctly on a server whose level is
+    "world"."""
+    parsed = parse_backup_archive_name(fname)
+    return parsed.dt if parsed else None
+
+
+def parse_backup_archive_name(fname: str) -> Optional[ParsedBackupName]:
+    """Split a backup archive's filename into world, timestamp and provider.
+
+    Patterns are tried most-specific first; see each regex above for why the
+    ordering and the guards are load-bearing. Returns None for anything that
+    doesn't look like a dated archive (a hand-renamed file, say) -- callers
+    fall back to the file's mtime."""
+    m = AROMA3_ARCHIVE_RE.match(fname)
+    if m:
+        try:
+            dt = datetime.strptime(m.group("stamp"), AROMA3_DATE_FORMAT)
+        except ValueError:
+            dt = None
+        return ParsedBackupName(m.group("name"), dt, m.group("stamp"), "aroma3")
+
+    m = AROMA0_ARCHIVE_RE.match(fname)
+    if m:
+        try:
+            dt = datetime(int(m.group("y")), int(m.group("mo")), int(m.group("d")),
+                          int(m.group("h")), int(m.group("mi")))
+        except ValueError:
+            dt = None
+        stamp = "{}-{:02d}-{:02d}--{:02d}-{:02d}".format(
+            m.group("y"), int(m.group("mo")), int(m.group("d")),
+            int(m.group("h")), int(m.group("mi")))
+        return ParsedBackupName(m.group("name"), dt, stamp, "aroma0")
+
+    m = DATED_ARCHIVE_RE.match(fname)
+    if m:
+        stamp = f"{m.group('date')}_{m.group('time')}"
+        try:
+            dt = datetime.strptime(stamp, "%Y-%m-%d_%H-%M-%S")
+        except ValueError:
+            dt = None
+        # AutoBackup and SimpleBackups are indistinguishable by name alone;
+        # the caller resolves it from the folder the file was found in.
+        return ParsedBackupName(m.group("name"), dt, stamp, "autobackup")
+
+    return None
+
+
+def read_aroma_backupinfo(path: Path) -> dict:
+    """Parse an AromaBackup .backupinfo sidecar.
+
+    It is a Java Properties file: comment lines start with '#', and the
+    payload is key=value -- though Properties also accepts key:value, and an
+    older Aroma wrote it that way, so both are handled. Returns {} when the
+    file is missing or unreadable; it is free metadata, never a requirement."""
+    out = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in text.replace("\r", "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("!"):
+            continue
+        for sep in ("=", ":"):
+            if sep in line:
+                k, v = line.split(sep, 1)
+                out[k.strip()] = v.strip()
+                break
+    return out
+
+
+def parse_backupstore_txt(path: Path) -> dict:
+    """AromaBackup 0.x's shared index: one "{level}={Y}={M}={D}={H}={M}" line
+    per world, unpadded. Split from the *right* -- the level name is free text
+    and can itself contain '='. Returns {level_name: datetime}."""
+    out = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in text.replace("\r", "").splitlines():
+        parts = line.strip().split("=")
+        if len(parts) < 6:
+            continue
+        level = "=".join(parts[:-5])
+        try:
+            y, mo, d, h, mi = (int(x) for x in parts[-5:])
+            out[level] = datetime(y, mo, d, h, mi)
+        except ValueError:
+            continue
+    return out
+
+
+def normalise_archive_name(name: str) -> str:
+    """Path separators inside a zip, made uniform.
+
+    AutoBackup writes every entry with backslashes -- out of spec (APPNOTE
+    says forward slash) but it is what Java's File.separator produces on
+    Windows. Left alone, zipfile treats "players\\data\\<uuid>.dat" as one
+    flat filename with no directories in it, so Path(name).parent is "." on
+    Linux/macOS and "players\\data" on Windows: behaviour that silently
+    changes by platform.
+
+    Note "./" prefixes are stripped as a *prefix*, in a loop -- str.lstrip
+    takes a set of characters, so lstrip("./") would turn "../escape.txt"
+    into "escape.txt" and quietly disarm the traversal check downstream."""
+    norm = name.replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
+def safe_archive_relpath(name: str) -> Optional[str]:
+    """A normalised archive entry name that is safe to join onto a
+    destination directory, or None if it isn't.
+
+    An archive is untrusted input and a restore writes with our privileges,
+    so absolute paths, Windows drive letters and any '..' segment are
+    rejected rather than sanitised -- there is no legitimate backup that
+    contains one, and a "cleaned up" traversal is still a traversal."""
+    norm = normalise_archive_name(name)
+    if not norm or norm.endswith("/"):
+        return None
+    if norm.startswith("/") or re.match(r"^[A-Za-z]:", norm):
+        return None
+    parts = [p for p in norm.split("/") if p != "."]
+    if not parts or any(p in ("..", "") for p in parts):
+        return None
+    return "/".join(parts)
+
+
+def archive_kind(path: Path) -> Optional[str]:
+    """Which container format this file is, by extension.
+
+    AromaBackup's S:compressionType accepts zip, tar, tar.gz and folder --
+    "folder" isn't an archive at all and is handled elsewhere, but the other
+    three all turn up as files in a backups directory."""
+    name = path.name.lower()
+    if name.endswith(".zip"):
+        return "zip"
+    if name.endswith(".tar.gz") or name.endswith(".tgz"):
+        return "tar.gz"
+    if name.endswith(".tar"):
+        return "tar"
+    return None
+
+
+BACKUP_ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".zip", ".tar")
+
+
+def strip_archive_suffix(name: str) -> str:
+    """An archive filename without its container extension. Longest suffix
+    first, so ".tar.gz" isn't left as ".tar"."""
+    lowered = name.lower()
+    for suffix in BACKUP_ARCHIVE_SUFFIXES:
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+class BackupArchive:
+    """A backup archive, read through one consistent lens.
+
+    Handles zip and tar containers, separator normalisation, locating the
+    world inside the archive, and the path-safety checks a restore needs. Use
+    as a context manager."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.kind = archive_kind(self.path) or "zip"
+        self.entries = []          # [(normalised name, member)] -- files only
+        self._raw_by_norm = {}     # normalised name -> the name the lib wants
+        if self.kind == "zip":
+            self._zf = zipfile.ZipFile(self.path)
+            self._tf = None
+            members = [z for z in self._zf.infolist() if not z.is_dir()]
+            raw_names = [z.filename for z in members]
+        else:
+            self._zf = None
+            mode = "r:gz" if self.kind == "tar.gz" else "r:"
+            self._tf = tarfile.open(self.path, mode)
+            members = [m for m in self._tf.getmembers() if m.isfile()]
+            raw_names = [m.name for m in members]
+        for member, raw in zip(members, raw_names):
+            norm = normalise_archive_name(raw)
+            self.entries.append((norm, member))
+            self._raw_by_norm[norm] = member
+        self.world_root = self._find_world_root()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        if self._zf is not None:
+            self._zf.close()
+        if self._tf is not None:
+            self._tf.close()
+
+    def _find_world_root(self) -> str:
+        """Where the world starts inside the archive: "" when its contents sit
+        at the root (AutoBackup, Aroma 3.x), or "world/" / "level with
+        spaces/" when it is nested (SimpleBackups, Aroma 0.x).
+
+        Found as the *shallowest* level.dat -- a nested archive also contains
+        DIM-1/level.dat and the satellite stubs, which are deeper."""
+        candidates = [n for n, _ in self.entries if n.rsplit("/", 1)[-1] == "level.dat"]
+        if not candidates:
+            return ""
+        shallowest = min(candidates, key=lambda n: n.count("/"))
+        return shallowest[: -len("level.dat")]
+
+    def rel(self, name: str) -> str:
+        """An entry's path relative to the world root."""
+        norm = normalise_archive_name(name)
+        if self.world_root and norm.startswith(self.world_root):
+            return norm[len(self.world_root):]
+        return norm
+
+    def world_entries(self):
+        """(path-within-the-world, ZipInfo) for everything under the world
+        root, with the files no restore should ever write filtered out."""
+        for norm, zinfo in self.entries:
+            if self.world_root and not norm.startswith(self.world_root):
+                continue
+            rel = self.rel(norm)
+            if not rel or rel.rsplit("/", 1)[-1] in EXPORT_SKIP_FILES:
+                continue
+            if safe_archive_relpath(rel) is None:
+                continue
+            yield rel, zinfo
+
+    def _member(self, name: str):
+        member = self._raw_by_norm.get(normalise_archive_name(name))
+        if member is None:
+            raise KeyError(name)
+        return member
+
+    def read(self, name: str) -> bytes:
+        with self.open(name) as fh:
+            return fh.read()
+
+    def open(self, name: str):
+        """A binary file object for one entry. Callers treat zip and tar
+        alike; tarfile hands back None for a member it can't extract, which
+        becomes a KeyError here so it surfaces the same way a missing zip
+        entry would."""
+        member = self._member(name)
+        if self._zf is not None:
+            return self._zf.open(member)
+        fh = self._tf.extractfile(member)
+        if fh is None:
+            raise KeyError(name)
+        return fh
+
+    @property
+    def has_level_dat(self) -> bool:
+        return any(n.rsplit("/", 1)[-1] == "level.dat" for n, _ in self.entries)
+
+    def incremental_reason(self) -> Optional[str]:
+        """Why this archive can't be restored on its own, or None.
+
+        A delta restored alone produces a world with holes and *looks* like a
+        success, so this errs toward refusing. Neither sample in the test set
+        is actually incremental, so both checks are built from the formats
+        rather than from an observed delta."""
+        if not self.has_level_dat:
+            return "no level.dat -- this looks like a partial or incremental archive"
+        manifest = next((n for n, _ in self.entries if n == AROMA_MANIFEST_NAME), None)
+        if manifest is not None:
+            try:
+                listed = 0
+                for line in self.read(manifest).decode("utf-8", "replace").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        listed += 1
+            except (OSError, KeyError, zipfile.BadZipFile, tarfile.TarError):
+                return None
+            present = len(self.entries) - 1   # the manifest doesn't list itself
+            if listed > present:
+                return (f"its manifest lists {listed} files but the archive holds "
+                        f"{present} -- an incremental backup that needs its chain")
+        return None
+
+    def player_file_entries(self, uuid: str) -> list:
+        """Normalised entry names for one player's files.
+
+        Prefix match rather than "{uuid}.dat" so stray siblings a mod may have
+        written ("<uuid> - Copy.dat", "<uuid>.dat_old") come along, matching
+        what _export_playerdata does. Both world layouts are accepted -- an
+        archive carries whatever the server was running when it was taken,
+        which is not necessarily what it runs now."""
+        matches = []
+        for norm, _zinfo in self.entries:
+            rel = self.rel(norm)
+            parent, _, base = rel.rpartition("/")
+            if parent not in ("playerdata", "players/data"):
+                continue
+            if base.startswith(uuid):
+                matches.append(norm)
+        return matches
+
+
+def open_backup_archive(path: Path) -> Optional[BackupArchive]:
+    """BackupArchive for `path`, or None if it isn't a readable zip. A
+    truncated or half-downloaded archive is an ordinary thing to find in a
+    backups folder and must not abort a scan."""
+    try:
+        return BackupArchive(path)
+    except (OSError, zipfile.BadZipFile, tarfile.TarError, RuntimeError, EOFError):
+        return None
+
+
+def find_uuid_entries_in_zip(zf, uuid: str) -> list:
+    """Backwards-compatible wrapper. Accepts either a BackupArchive or a raw
+    zipfile.ZipFile so older call sites keep working, but routes both through
+    the normalising reader -- passing a raw ZipFile used to silently return
+    nothing for AutoBackup archives on Linux/macOS."""
+    if isinstance(zf, BackupArchive):
+        return zf.player_file_entries(uuid)
+    matches = []
+    for name in zf.namelist():
+        norm = normalise_archive_name(name)
+        parent, _, base = norm.rpartition("/")
+        tail = parent.rsplit("/", 2)[-2:]
+        is_playerdata = parent.endswith("playerdata") or tail == ["players", "data"]
+        if is_playerdata and base.startswith(uuid):
+            matches.append(name)
+    return matches
+
+
+# ---------------------------------------------------------------------------
+# Which backup tool made these, and where does it keep them
+# ---------------------------------------------------------------------------
+
+def _read_forge_cfg(path: Path) -> dict:
+    """Values out of a Forge-style .cfg (the "S:key=value" / "I:key=value"
+    format both AromaBackup generations use). Type prefixes are dropped;
+    everything comes back as a string."""
+    out = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for m in re.finditer(r"^\s*(?:[BISD]:)?([\w.\-]+)\s*=\s*(.*?)\s*$", text, re.M):
+        out[m.group(1)] = m.group(2)
+    return out
+
+
+def _read_simple_yaml_scalar(path: Path, key: str) -> Optional[str]:
+    """One top-level scalar out of a small YAML config, without taking a
+    dependency on a YAML parser for the two keys we actually want."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(rf"^{re.escape(key)}\s*:\s*(.+?)\s*(?:#.*)?$", text, re.M)
     if not m:
         return None
+    return m.group(1).strip().strip('"').strip("'")
+
+
+@dataclass
+class BackupProvider:
+    key: str
+    name: str
+    version: Optional[str] = None
+    config_path: Optional[Path] = None
+    search_dirs: list = field(default_factory=list)
+    retention: Optional[str] = None
+    evidence: list = field(default_factory=list)
+
+    @property
+    def restorable(self) -> bool:
+        return self.key in RESTORABLE_PROVIDERS
+
+
+def detect_backup_providers(info: "ServerInfo") -> list:
+    """Backup tooling installed on this server, with wherever each one is
+    configured to write.
+
+    Two sources, for the same reason platform detection uses two: a tool can
+    be installed with no backups yet, and archives outlive the tool that made
+    them. Probe A reads the jars and configs; Probe C reads the world's own
+    mod list, which names the mod and its version and survives the jar being
+    deleted. Bukkit plugins are not mods and never appear there, so C
+    supplements A rather than replacing it."""
+    root = info.path
+    mods = info.platform.loaded_mods or {}
+    found = []
+
+    def add(key, **kw):
+        found.append(BackupProvider(key=key, name=BACKUP_PROVIDER_NAMES[key], **kw))
+
+    # --- AromaBackup. The two generations share a jar name and differ only by
+    # config filename case, which Windows does not preserve -- so tell them
+    # apart by the config's *contents* (3.x grew a [backup_location] section)
+    # and cross-check against the mod version from the world.
+    aroma_cfg = None
+    for candidate in ("aromabackup.cfg", "AromaBackup.cfg"):
+        p = root / "config" / "aroma1997" / candidate
+        if p.is_file():
+            aroma_cfg = p
+            break
+    aroma_version = mods.get("aromabackup")
+    if aroma_cfg is not None or aroma_version:
+        cfg = _read_forge_cfg(aroma_cfg) if aroma_cfg else {}
+        is_new = "filename" in cfg or "fullBackupsToKeep" in cfg
+        if not cfg and aroma_version:
+            is_new = not aroma_version.startswith("0.")
+        location = cfg.get("location", "./backups").strip()
+        base = (root / location).resolve() if location else get_backups_dir(info)
+        if is_new:
+            add("aroma3", version=aroma_version, config_path=aroma_cfg,
+                search_dirs=[base, base / info.level_name],
+                retention=(f"keeps {cfg['fullBackupsToKeep']} full backups"
+                           if cfg.get("fullBackupsToKeep") else None),
+                evidence=[str(aroma_cfg)] if aroma_cfg else ["world mod list"])
+        else:
+            add("aroma0", version=aroma_version, config_path=aroma_cfg,
+                search_dirs=[base, base / info.level_name],
+                retention=(f"keeps {cfg['keep']} backups" if cfg.get("keep") else None),
+                evidence=[str(aroma_cfg)] if aroma_cfg else ["world mod list"])
+
+    # --- AutoBackup (Bukkit plugin)
+    ab_cfg = root / "plugins" / "AutoBackup" / "config.yml"
+    ab_jar = next(iter(sorted((root / "plugins").glob("AutoBackup*.jar"))), None) \
+        if (root / "plugins").is_dir() else None
+    if ab_cfg.is_file() or ab_jar is not None:
+        rel = _read_simple_yaml_scalar(ab_cfg, "backup-path") if ab_cfg.is_file() else None
+        keep = _read_simple_yaml_scalar(ab_cfg, "max-backups") if ab_cfg.is_file() else None
+        base = (root / (rel or "backups")).resolve()
+        add("autobackup", config_path=ab_cfg if ab_cfg.is_file() else None,
+            search_dirs=[base],
+            retention=f"keeps {keep} archives" if keep else None,
+            evidence=[str(x) for x in (ab_jar, ab_cfg) if x])
+
+    # --- SimpleBackups (Forge/NeoForge mod)
+    sb_cfg = root / "config" / "simplebackups-common.toml"
+    sb_version = mods.get("simplebackups")
+    if sb_cfg.is_file() or sb_version:
+        cfg = {}
+        if sb_cfg.is_file():
+            try:
+                text = sb_cfg.read_text(encoding="utf-8", errors="replace")
+                cfg = dict(re.findall(r'^\s*(\w+)\s*=\s*"?([^"\n]*)"?\s*$', text, re.M))
+            except OSError:
+                cfg = {}
+        base = (root / cfg.get("outputPath", "simplebackups")).resolve()
+        dirs = [base, base / info.level_name]
+        add("simplebackups", version=sb_version,
+            config_path=sb_cfg if sb_cfg.is_file() else None,
+            search_dirs=dirs,
+            retention=f"keeps {cfg['backupsToKeep']}" if cfg.get("backupsToKeep") else None,
+            evidence=([str(sb_cfg)] if sb_cfg.is_file() else []) +
+                     (["onlyModified=true -- archives may be incremental"]
+                      if cfg.get("onlyModified") == "true" else []))
+
+    # --- x-backup (Fabric): a blob store, listed but never restored from here
+    xb_dir = root / "xb.backups"
+    if xb_dir.is_dir() or mods.get("x_backup") or mods.get("xbackup"):
+        add("xbackup", version=mods.get("x_backup") or mods.get("xbackup"),
+            search_dirs=[xb_dir], evidence=[str(xb_dir)] if xb_dir.is_dir() else [])
+
+    # --- ServerBackup (Fabric): plain directory trees
+    sbk_dir = root / "server_backups" / "manual_backups"
+    if sbk_dir.is_dir() or (root / "backup_history.json").is_file():
+        add("serverbackup", search_dirs=[sbk_dir],
+            evidence=[str(sbk_dir)] if sbk_dir.is_dir() else ["backup_history.json"])
+
+    return found
+
+
+def backup_search_dirs(info: "ServerInfo") -> list:
+    """Every folder that might hold this world's archives, most specific
+    first, de-duplicated. Configured provider paths win over the conventional
+    ones; the conventional ones stay so that archives left behind by a tool
+    that has since been uninstalled still list."""
+    dirs = []
+    seen = set()
+
+    def add(d: Path):
+        try:
+            key = d.resolve()
+        except OSError:
+            key = d
+        if key in seen or not d.is_dir():
+            return
+        seen.add(key)
+        dirs.append(d)
+
+    for provider in detect_backup_providers(info):
+        for d in provider.search_dirs:
+            add(d)
+    backups = get_backups_dir(info)
+    # Ours. Listed first so a safety copy is always visible in the rollback
+    # dialog -- a safety backup nobody can find is not a safety backup.
+    add(backups / "mcsm-safety")
+    add(backups / info.level_name)
+    add(backups)
+    simple = info.path / "simplebackups"
+    add(simple / info.level_name)
+    add(simple)
+    return dirs
+
+
+def _iter_backup_archive_files(folder: Path):
+    """Archive files directly in `folder`, plus AromaBackup 0.x's
+    {Y}/{M}/{D}/ nesting -- which is why this can't just glob one level.
+    Bounded to that depth so a backups folder that happens to contain an
+    unpacked world isn't walked in full."""
+    def is_archive(p: Path) -> bool:
+        return p.is_file() and archive_kind(p) is not None
+
     try:
-        return datetime.strptime(m.group(1), BACKUP_DATE_FORMAT)
-    except ValueError:
-        return None
+        for entry in sorted(folder.iterdir()):
+            if is_archive(entry):
+                yield entry
+            elif entry.is_dir() and re.fullmatch(r"\d{1,4}", entry.name):
+                for sub in sorted(entry.rglob("*")):
+                    if is_archive(sub) and len(sub.relative_to(entry).parts) <= 3:
+                        yield sub
+    except OSError:
+        return
+
+
+@dataclass
+class BackupMember:
+    path: Path
+    world_folder: str
+    size_bytes: int = 0
+
+
+@dataclass
+class BackupSet:
+    """One backup, which on a split world is several archives sharing a
+    timestamp."""
+    stamp: str
+    dt: Optional[datetime]
+    provider: str
+    members: dict = field(default_factory=dict)   # world folder -> BackupMember
+
+    @property
+    def provider_name(self) -> str:
+        return BACKUP_PROVIDER_NAMES.get(self.provider, self.provider)
+
+    @property
+    def restorable(self) -> bool:
+        return self.provider in RESTORABLE_PROVIDERS
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(m.size_bytes for m in self.members.values())
+
+    @property
+    def paths(self) -> list:
+        return [m.path for m in self.members.values()]
+
+    def display_date(self) -> str:
+        if self.dt:
+            return self.dt.strftime("%Y-%m-%d %H:%M")
+        return self.stamp or (self.paths[0].name if self.paths else "?")
+
+    def missing_folders(self, info: "ServerInfo") -> list:
+        """World folders this server has now that the set has no archive for.
+        Restoring an incomplete set leaves the world inconsistent."""
+        expected = [info.level_name]
+        if has_satellite_dimension_folders(info):
+            expected += [f"{info.level_name}_nether", f"{info.level_name}_the_end"]
+        return [name for name in expected if name not in self.members]
 
 
 def list_world_backups(info: "ServerInfo") -> list:
-    """All dated backup zips for this world, newest first. Filenames that
-    don't match the expected "Backup--{level_name}--{date}.zip" pattern are
-    still included (falling back to the file's mtime) rather than silently
-    dropped."""
-    backups_dir = get_world_backups_dir(info)
-    entries = []
-    try:
-        zips = sorted(backups_dir.glob("*.zip"))
-    except OSError:
-        return []
-    for fp in zips:
-        dt = parse_backup_filename(fp.name, info.level_name)
-        if dt is None:
+    """Every backup this server has, newest first, grouped into sets.
+
+    A split (Bukkit) world is archived as one file per world folder sharing a
+    single timestamp, so the returned unit is a BackupSet rather than a file.
+    Grouping is on the raw stamp text, not the parsed datetime: the members
+    are written seconds apart -- one confirmed sample is named 17-00-39 while
+    its newest entry is stamped 17:00:38 -- and the stamp is the only thing
+    they agree on."""
+    provider_by_dir = {}
+    for provider in detect_backup_providers(info):
+        for d in provider.search_dirs:
             try:
-                dt = datetime.fromtimestamp(fp.stat().st_mtime)
+                provider_by_dir.setdefault(d.resolve(), provider.key)
             except OSError:
-                dt = None
-        entries.append(BackupEntry(path=fp, dt=dt))
-    entries.sort(key=lambda e: e.dt or datetime.min, reverse=True)
-    return entries
+                pass
+
+    sets = {}
+    for folder in backup_search_dirs(info):
+        try:
+            folder_provider = provider_by_dir.get(folder.resolve())
+        except OSError:
+            folder_provider = None
+        for fp in _iter_backup_archive_files(folder):
+            parsed = parse_backup_archive_name(fp.name)
+            if parsed is None:
+                try:
+                    dt = datetime.fromtimestamp(fp.stat().st_mtime)
+                except OSError:
+                    dt = None
+                parsed = ParsedBackupName(fp.stem, dt, fp.name, "unknown")
+            provider = parsed.provider
+            if folder.name == "mcsm-safety":
+                provider = "mcsm-safety"
+            elif provider == "autobackup" and folder_provider in ("simplebackups",):
+                # The two share a filename grammar; the folder disambiguates.
+                provider = folder_provider
+            elif parsed.provider == "unknown" and folder_provider:
+                provider = folder_provider
+            key = (provider, parsed.stamp)
+            bset = sets.get(key)
+            if bset is None:
+                bset = sets[key] = BackupSet(stamp=parsed.stamp, dt=parsed.dt,
+                                             provider=provider)
+            try:
+                size = fp.stat().st_size
+            except OSError:
+                size = 0
+            bset.members.setdefault(
+                parsed.world, BackupMember(path=fp, world_folder=parsed.world,
+                                           size_bytes=size))
+    out = sorted(sets.values(), key=lambda s: s.dt or datetime.min, reverse=True)
+    return out
 
 
-def find_uuid_entries_in_zip(zf: zipfile.ZipFile, uuid: str) -> list:
-    """Entries inside a backup zip that belong to the given player's
-    playerdata (prefix match, same convention as _export_playerdata --
-    catches stray "<uuid> - Copy.dat"-style files too). Tolerant of the
-    backup being rooted at the world folder or not -- only the immediate
-    parent folder name is checked, not the full path."""
-    matches = []
-    for name in zf.namelist():
-        if not get_playerdata_dir_for_zip_match(name):
+# ---------------------------------------------------------------------------
+# Writing a backup
+#
+# Decision: mimic whatever convention the server's own backup tool uses, so
+# the archives we write sit alongside its own rather than in a parallel
+# folder nobody looks in. The costs of that are real and are spelled out for
+# the user in the confirm dialog:
+#
+#   * their retention applies to ours -- AutoBackup keeps 15, SimpleBackups
+#     10, Aroma 3.x 30 full backups -- so ours are eventually pruned;
+#   * we cannot tell ours from theirs afterwards, which is why nothing in
+#     this app ever offers to prune or bulk-delete backups;
+#   * on Aroma we inherit its sidecar contract (see below).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BackupConvention:
+    provider: str
+    directory: Path
+    nested: bool           # world contents under "{folder}/" inside the archive
+    date_nested: bool      # archives filed under {Y}/{M}/{D}/
+    sidecar: Optional[str] # "backupinfo" | "backupstore" | None
+    kind: str = "zip"      # container format: zip | tar | tar.gz
+
+    @property
+    def suffix(self) -> str:
+        return {"tar": ".tar", "tar.gz": ".tar.gz"}.get(self.kind, ".zip")
+
+    def archive_name(self, world_folder: str, dt: datetime) -> str:
+        if self.provider == "aroma3":
+            return (f"Backup--{world_folder}--{dt.strftime(AROMA3_DATE_FORMAT)}"
+                    f"{self.suffix}")
+        if self.provider == "aroma0":
+            # 0.x predates the compressionType option and is always a zip.
+            return (f"Backup-{world_folder}-{dt.year}-{dt.month}-{dt.day}"
+                    f"--{dt.hour:02d}-{dt.minute:02d}.zip")
+        return f"{world_folder}_{dt.strftime('%Y-%m-%d_%H-%M-%S')}.zip"
+
+    def target_dir(self, level_name: str, dt: datetime) -> Path:
+        d = self.directory
+        if self.date_nested:
+            d = d / str(dt.year) / str(dt.month) / str(dt.day)
+        return d
+
+
+def resolve_backup_convention(info: "ServerInfo",
+                              purpose: str = "manual") -> BackupConvention:
+    """How to write a backup on this server, following whatever is already
+    installed. Falls back to the AutoBackup shape in backups/, which is the
+    most common and matches what get_world_backups_dir already reads.
+
+    purpose="safety" is the deliberate exception to the mimicry rule. A
+    pre-rollback safety copy written under the local convention counts
+    toward the installed tool's retention, and on a full folder that can
+    evict the very archive the user is restoring *from*. It is the one
+    backup whose entire purpose is to survive, so it goes somewhere we
+    control and nothing else prunes."""
+    if purpose == "safety":
+        return BackupConvention("mcsm-safety",
+                                get_backups_dir(info) / "mcsm-safety",
+                                False, False, None)
+    providers = {p.key: p for p in detect_backup_providers(info)}
+    for key in ("aroma3", "aroma0", "simplebackups", "autobackup"):
+        p = providers.get(key)
+        if p is None:
             continue
-        if Path(name).name.startswith(uuid):
-            matches.append(name)
-    return matches
+        base = p.search_dirs[0] if p.search_dirs else get_backups_dir(info)
+        if key == "aroma3":
+            # Aroma can be configured to emit tar or tar.gz instead of zip.
+            # Mimicry means matching that, or ours is the odd file out in a
+            # folder the mod is pruning by pattern.
+            kind = "zip"
+            if p.config_path is not None:
+                ctype = _read_forge_cfg(p.config_path).get("compressionType", "zip")
+                if ctype in ("tar", "tar.gz"):
+                    kind = ctype
+            return BackupConvention("aroma3", base / info.level_name, False, False,
+                                    "backupinfo", kind)
+        if key == "aroma0":
+            return BackupConvention("aroma0", base / info.level_name, True, True,
+                                    "backupstore")
+        if key == "simplebackups":
+            return BackupConvention("simplebackups", base, True, False, None)
+        return BackupConvention("autobackup", base, False, False, None)
+    return BackupConvention("autobackup", get_backups_dir(info), False, False, None)
+
+
+def _archive_world_folder(src: Path, dest_part: Path, arc_prefix: str,
+                          kind: str = "zip", progress_cb=None,
+                          cancel_event=None) -> int:
+    """Archive one world folder to dest_part. Returns files written.
+
+    Always writes forward slashes, even when mimicking AutoBackup: its
+    backslashes are out of spec, nothing reads ours by path except us, and
+    the retention we are blending in with is filename-based."""
+    count = 0
+    if kind == "zip":
+        container = zipfile.ZipFile(dest_part, "w", zipfile.ZIP_DEFLATED)
+        add = lambda src_file, arcname: container.write(src_file, arcname)
+    else:
+        container = tarfile.open(dest_part, "w:gz" if kind == "tar.gz" else "w")
+        add = lambda src_file, arcname: container.add(src_file, arcname,
+                                                      recursive=False)
+    with container:
+        for abs_path, rel_path in _iter_files(src):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ExportCancelled()
+            if abs_path.name in EXPORT_SKIP_FILES:
+                continue
+            arcname = arc_prefix + rel_path.as_posix()
+            try:
+                add(abs_path, arcname)
+            except OSError:
+                # A file that vanished or can't be read mid-walk shouldn't
+                # abort a backup of everything else.
+                continue
+            count += 1
+            if progress_cb is not None:
+                progress_cb(count, abs_path.name)
+    return count
+
+
+def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
+                        progress_cb=None, cancel_event=None,
+                        purpose: str = "manual") -> list:
+    """Back this server's world up, following the local convention. Returns
+    the archive paths written, newest-set-first order irrelevant.
+
+    On a split world this writes one archive per world folder, all from a
+    single datetime so they group as one set, and all-or-nothing: every
+    archive is staged as a .part and only renamed once the last one closes.
+    A half-written set must never look like a backup."""
+    dt = dt or datetime.now()
+    convention = resolve_backup_convention(info, purpose)
+    target = convention.target_dir(info.level_name, dt)
+    target.mkdir(parents=True, exist_ok=True)
+
+    folders = [(info.level_name, get_world_dir(info))]
+    if has_satellite_dimension_folders(info):
+        folders.append((f"{info.level_name}_nether", get_nether_dir(info)))
+        folders.append((f"{info.level_name}_the_end", get_the_end_dir(info)))
+    folders = [(name, path) for name, path in folders if path.is_dir()]
+    if not folders:
+        raise OSError(f"No world folder found at {get_world_dir(info)}")
+
+    # Two backups in the same second would collide. The stamp has seconds
+    # resolution (Aroma's has minutes), so nudge the clock forward rather
+    # than inventing a suffix -- a suffix would break the filename grammar
+    # and orphan the set from its siblings.
+    step = 60 if convention.provider in ("aroma3", "aroma0") else 1
+    for _ in range(120):
+        names = [convention.archive_name(n, dt) for n, _ in folders]
+        if not any((target / n).exists() for n in names):
+            break
+        dt = dt + timedelta(seconds=step)
+        target = convention.target_dir(info.level_name, dt)
+
+    parts, finals = [], []
+    try:
+        for world_folder, src in folders:
+            name = convention.archive_name(world_folder, dt)
+            final = target / name
+            part = target / (name + ".part")
+            prefix = f"{world_folder}/" if convention.nested else ""
+            _archive_world_folder(src, part, prefix, convention.kind,
+                                  progress_cb, cancel_event)
+            parts.append(part)
+            finals.append(final)
+    except BaseException:
+        for part in parts:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+        raise
+
+    for part, final in zip(parts, finals):
+        os.replace(part, final)
+
+    _write_backup_sidecar(info, convention, target, finals, dt)
+    return finals
+
+
+def _write_backup_sidecar(info: "ServerInfo", convention: BackupConvention,
+                          target: Path, archives: list, dt: datetime) -> None:
+    """The metadata file the local convention expects beside an archive.
+
+    Mimicry reverses the "never write a sidecar" default on Aroma servers:
+    Aroma's own file says "Do not move, edit or delete this file. If you do,
+    backups may not be automatically restorable", and AromaBackupRecovery
+    reads it. An archive of ours dropped into an Aroma folder without one is
+    exactly the half-a-backup that warning describes. Everywhere else this
+    writes nothing.
+
+    Deliberately never writes incremental.aromabackup -- ours are always full
+    backups, and a manifest we generated would become the baseline Aroma
+    diffs its next incremental against: a chain rooted in a file we wrote and
+    do not maintain."""
+    try:
+        if convention.sidecar == "backupinfo":
+            body = (
+                "#=============================================\r\n"
+                "#This is an important file for your backups.\r\n"
+                "#Do not move, edit or delete this file.\r\n"
+                "#If you do, backups may not be automatically restorable.\r\n"
+                "#=============================================\r\n"
+                f"#{dt.strftime('%a %b %d %H:%M:%S %Z %Y').replace('  ', ' ')}\r\n"
+                f"date={int(dt.timestamp() * 1000)}\r\n"
+                f"world={info.level_name}\r\n"
+            )
+            for archive in archives:
+                # Not Path.with_suffix: it replaces only the final component,
+                # so "Backup--world--….tar.gz" would become "….tar.backupinfo".
+                sidecar_path = archive.with_name(
+                    strip_archive_suffix(archive.name) + ".backupinfo")
+                sidecar_path.write_bytes(body.encode("utf-8"))
+        elif convention.sidecar == "backupstore":
+            # Aroma 0.x keeps one shared index at the world's backup root
+            # (above the {Y}/{M}/{D} nesting), one line per world. Append
+            # rather than overwrite -- other worlds have lines in here.
+            store = convention.directory / "backupstore.txt"
+            line = (f"{info.level_name}={dt.year}={dt.month}={dt.day}"
+                    f"={dt.hour}={dt.minute}\r\n")
+            existing = ""
+            if store.is_file():
+                existing = store.read_text(encoding="utf-8", errors="replace")
+                kept = [l for l in existing.replace("\r", "").splitlines()
+                        if l.strip() and not l.startswith(f"{info.level_name}=")]
+                existing = "".join(l + "\r\n" for l in kept)
+            store.write_text(existing + line, encoding="utf-8", newline="")
+    except OSError:
+        # The archives are already in place and are the actual backup; a
+        # sidecar we couldn't write is worth neither failing nor rolling back.
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Restoring
+# ---------------------------------------------------------------------------
+
+RESTORE_SCOPES = ("all", "world", "players")
+
+# Folders inside a world that hold per-player state, in both layouts. An
+# archive carries whichever the server was running when it was taken, which
+# is not necessarily what it runs now, so both are always matched.
+PLAYER_SUBPATHS = ("playerdata/", "players/", "stats/", "advancements/")
+
+
+def _is_player_path(rel: str) -> bool:
+    return any(rel == p.rstrip("/") or rel.startswith(p) for p in PLAYER_SUBPATHS)
+
+
+def restore_backup_set(info: "ServerInfo", bset: "BackupSet", scope: str = "all",
+                       progress_cb=None, cancel_event=None) -> dict:
+    """Restore a whole backup set over the live world.
+
+    Every member is unpacked to a sibling temp folder first, then applied --
+    never straight over a live world. For scope "all" each world folder is
+    swapped out wholesale and the displaced copy is kept as
+    {folder}.old-{stamp} until every member has landed, so a failure part way
+    through a three-dimension restore can be undone. Partial scopes copy over
+    the top instead (overwrite-only; full replacement is what "all" is for).
+
+    Returns {"restored": [folder names], "files": n}."""
+    if scope not in RESTORE_SCOPES:
+        raise ValueError(f"unknown restore scope: {scope}")
+
+    targets = []
+    for world_folder, member in sorted(bset.members.items()):
+        dest = info.path / world_folder
+        targets.append((world_folder, member, dest))
+
+    stamp = bset.stamp.replace(":", "-").replace(" ", "_")
+    temp_dirs, swapped = [], []
+    files_done = 0
+    try:
+        # Phase 1: unpack everything. Nothing live is touched yet, so a bad
+        # archive discovered here costs nothing.
+        staged = []
+        for world_folder, member, dest in targets:
+            archive = open_backup_archive(member.path)
+            if archive is None:
+                raise OSError(f"{member.path.name} is not a readable archive")
+            with archive:
+                tmp = dest.parent / f"{dest.name}.restore-tmp"
+                if tmp.exists():
+                    shutil.rmtree(tmp, ignore_errors=True)
+                tmp.mkdir(parents=True)
+                temp_dirs.append(tmp)
+                for rel, zinfo in archive.world_entries():
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ExportCancelled()
+                    if scope == "world" and _is_player_path(rel):
+                        continue
+                    if scope == "players" and not _is_player_path(rel):
+                        continue
+                    safe = safe_archive_relpath(rel)
+                    if safe is None:
+                        continue
+                    out_path = tmp / safe
+                    # Belt and braces over safe_archive_relpath: confirm the
+                    # resolved destination really is inside the temp folder
+                    # before opening it for writing.
+                    try:
+                        out_path.resolve().relative_to(tmp.resolve())
+                    except ValueError:
+                        continue
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(rel if not archive.world_root
+                                      else archive.world_root + rel) as src, \
+                            open(out_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    files_done += 1
+                    if progress_cb is not None:
+                        progress_cb(files_done, rel)
+                staged.append((world_folder, tmp, dest))
+
+        # Phase 2: apply. For "all" this is a directory swap per member; the
+        # displaced copies are only deleted once every member has landed.
+        for world_folder, tmp, dest in staged:
+            if scope == "all":
+                old = None
+                if dest.exists():
+                    old = dest.parent / f"{dest.name}.old-{stamp}"
+                    if old.exists():
+                        shutil.rmtree(old, ignore_errors=True)
+                    os.replace(dest, old)
+                os.replace(tmp, dest)
+                swapped.append((dest, old))
+            else:
+                for src_file in tmp.rglob("*"):
+                    if src_file.is_dir():
+                        continue
+                    rel = src_file.relative_to(tmp)
+                    out = dest / rel
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, out)
+                shutil.rmtree(tmp, ignore_errors=True)
+        temp_dirs = [t for t in temp_dirs if t.exists()]
+    except BaseException:
+        # Put back anything already swapped, newest first.
+        for dest, old in reversed(swapped):
+            try:
+                if old is not None:
+                    if dest.exists():
+                        shutil.rmtree(dest, ignore_errors=True)
+                    os.replace(old, dest)
+            except OSError:
+                pass
+        for tmp in temp_dirs:
+            shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+    for _dest, old in swapped:
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
+    for tmp in temp_dirs:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return {"restored": [t[0] for t in targets], "files": files_done}
 
 
 def compute_folder_size(path: Path) -> int:
@@ -2464,6 +3484,44 @@ class App(tk.Tk):
                     info, size_bytes = payload
                     if info is self.current_server:
                         self.backup_size_label.config(text=f"Backup size: {format_size(size_bytes)}")
+                elif kind == "backup_progress":
+                    info, n, name = payload
+                    progress = getattr(self, "_backup_progress", None)
+                    if progress:
+                        try:
+                            progress["detail"].config(text=f"{n} files -- {name[:44]}")
+                        except tk.TclError:
+                            pass
+                elif kind == "backup_done":
+                    info, paths, error = payload
+                    self._close_progress_dialog(getattr(self, "_backup_progress", None))
+                    self._backup_progress = None
+                    if error is not None:
+                        messagebox.showerror("Backup Failed", str(error))
+                    elif paths is None:
+                        self.status_var.set("Backup cancelled")
+                    else:
+                        # The backup folder just grew; drop the cached sizes
+                        # so the detail pane recomputes on next selection.
+                        info.backup_size_bytes = None
+                        info.sizes_computed = False
+                        names = ", ".join(p.name for p in paths)
+                        self.status_var.set(
+                            f"Backed up {info.level_name}: {len(paths)} archive"
+                            f"{'s' if len(paths) != 1 else ''} ({names})")
+                elif kind == "restore_progress":
+                    n, name = payload
+                    progress = getattr(self, "_restore_progress", None)
+                    if progress:
+                        try:
+                            progress["detail"].config(text=f"{n} files -- {name[:44]}")
+                        except tk.TclError:
+                            pass
+                elif kind == "restore_done":
+                    info, result, error = payload
+                    self._close_progress_dialog(getattr(self, "_restore_progress", None))
+                    self._restore_progress = None
+                    self._finish_world_restore(info, result, error)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -2488,6 +3546,16 @@ class App(tk.Tk):
         has_backups = get_backups_dir(info).is_dir()
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="Open Folder...", command=lambda: self._open_server_folder(info))
+        menu.add_command(
+            label="Create Backup...",
+            command=lambda: self._create_backup(info),
+            state="normal" if get_world_dir(info).is_dir() else "disabled",
+        )
+        menu.add_command(
+            label="Roll Back World...",
+            command=lambda: self._open_world_rollback_dialog(info),
+            state="normal" if get_world_dir(info).is_dir() else "disabled",
+        )
         menu.add_command(
             label="Browse Backups...",
             command=lambda: self._open_backups_folder(info),
@@ -2536,6 +3604,377 @@ class App(tk.Tk):
             subprocess.run(["explorer", str(target_dir)])
         except OSError as e:
             messagebox.showerror("Error", f"Could not open Explorer: {e}")
+
+    # -- Creating a backup ----------------------------------------------------
+
+    def _create_backup(self, info: ServerInfo):
+        """Back the world up now, following whatever convention the server's
+        own backup tool uses."""
+        world_dir = get_world_dir(info)
+        if not world_dir.is_dir():
+            messagebox.showwarning("World Not Found", f"{world_dir} no longer exists.")
+            return
+
+        convention = resolve_backup_convention(info)
+        providers = detect_backup_providers(info)
+        folders = [info.level_name]
+        if has_satellite_dimension_folders(info):
+            folders += [f"{info.level_name}_nether", f"{info.level_name}_the_end"]
+
+        size_note = (format_size(info.world_size_bytes)
+                     if info.world_size_bytes is not None else "not yet calculated")
+        lines = [
+            f"Back up {info.level_name} from {info.name}?",
+            "",
+            f"Archives:     {len(folders)} ({', '.join(folders)})",
+            f"Destination:  {convention.target_dir(info.level_name, datetime.now())}",
+            f"World size:   {size_note}",
+        ]
+        matching = next((p for p in providers if p.key == convention.provider), None)
+        if matching is not None:
+            # Mimicry means their retention counts ours. Say so before the
+            # user relies on this archive being there next month.
+            note = matching.retention or "its own retention policy"
+            lines += ["",
+                      f"This follows {matching.name}'s naming, so it will sit "
+                      f"alongside its archives -- and {note} applies to this one too."]
+        live = server_looks_live(info)
+        if live:
+            lines += ["", f"WARNING: {live}",
+                      "A backup taken while the server is writing may be inconsistent."]
+        if not messagebox.askyesno("Create Backup", "\n".join(lines)):
+            return
+
+        cancel_event = threading.Event()
+        progress = self._open_progress_dialog(
+            "Creating Backup", f"Backing up {info.level_name}...", cancel_event)
+
+        def worker():
+            try:
+                paths = create_world_backup(
+                    info, progress_cb=lambda n, name: self.task_queue.put(
+                        ("backup_progress", (info, n, name))),
+                    cancel_event=cancel_event)
+                self.task_queue.put(("backup_done", (info, paths, None)))
+            except ExportCancelled:
+                self.task_queue.put(("backup_done", (info, None, None)))
+            except Exception as e:
+                self.task_queue.put(("backup_done", (info, None, e)))
+
+        self._backup_progress = progress
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -- Rolling the world back -----------------------------------------------
+
+    def _open_world_rollback_dialog(self, info: ServerInfo):
+        """Pick a backup set and restore the whole world from it.
+
+        The list is of *sets*, not files: a split world is archived as one
+        file per dimension sharing a timestamp, and restoring one third of a
+        world is never what anyone means."""
+        sets = list_world_backups(info)
+        if not sets:
+            dirs = "\n".join(f"  {d}" for d in backup_search_dirs(info)) or "  (none found)"
+            messagebox.showinfo(
+                "No Backups Found",
+                f"No backup archives were found for {info.level_name}.\n\n"
+                f"Searched:\n{dirs}")
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Roll Back World - {info.name}")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text=f"Backups of {info.level_name}:",
+                  font=("Segoe UI", 10, "bold")).pack(padx=12, pady=(12, 6), anchor="w")
+
+        cols = ("provider", "dims", "size", "status")
+        tree = ttk.Treeview(dialog, columns=cols, show="tree headings", height=11)
+        tree.heading("#0", text="Date")
+        tree.heading("provider", text="Made by")
+        tree.heading("dims", text="Dimensions")
+        tree.heading("size", text="Size")
+        tree.heading("status", text="Status")
+        tree.column("#0", width=140)
+        tree.column("provider", width=130)
+        tree.column("dims", width=90, anchor="center")
+        tree.column("size", width=80, anchor="e")
+        tree.column("status", width=230)
+        tree.tag_configure("unavailable", foreground="#999999")
+        tree.tag_configure("suspect", foreground=DANGER_COLOR)
+        tree.pack(padx=12, fill="both", expand=True)
+
+        set_by_iid = {}
+        for bset in sets:
+            iid = tree.insert("", "end", text=bset.display_date(), values=(
+                bset.provider_name, len(bset.members),
+                format_size(bset.total_bytes), "Checking..."))
+            set_by_iid[iid] = bset
+            if not bset.restorable:
+                tree.item(iid, values=(
+                    bset.provider_name, len(bset.members),
+                    format_size(bset.total_bytes),
+                    "Read-only -- use the mod's own restore"), tags=("unavailable",))
+
+        result_queue: "queue.Queue" = queue.Queue()
+
+        def scan_worker():
+            for iid, bset in set_by_iid.items():
+                if not bset.restorable:
+                    continue
+                problems = []
+                for folder, member in sorted(bset.members.items()):
+                    archive = open_backup_archive(member.path)
+                    if archive is None:
+                        problems.append(f"{member.path.name} is unreadable")
+                        continue
+                    with archive:
+                        reason = archive.incremental_reason()
+                        if reason:
+                            problems.append(f"{folder}: {reason}")
+                missing = bset.missing_folders(info)
+                result_queue.put((iid, problems, missing))
+
+        threading.Thread(target=scan_worker, daemon=True).start()
+        ok_iids = set()
+
+        def poll_results():
+            if not dialog.winfo_exists():
+                return
+            try:
+                while True:
+                    iid, problems, missing = result_queue.get_nowait()
+                    bset = set_by_iid[iid]
+                    base = (bset.provider_name, len(bset.members),
+                            format_size(bset.total_bytes))
+                    if problems:
+                        tree.item(iid, values=base + (problems[0][:60],),
+                                  tags=("suspect",))
+                    elif missing:
+                        ok_iids.add(iid)
+                        tree.item(iid, values=base + (
+                            "Incomplete -- missing " + ", ".join(missing),),
+                            tags=("suspect",))
+                    else:
+                        ok_iids.add(iid)
+                        tree.item(iid, values=base + ("Ready",))
+            except queue.Empty:
+                pass
+            dialog.after(100, poll_results)
+
+        dialog.after(100, poll_results)
+
+        scope_var = tk.StringVar(value="all")
+        scope_frame = ttk.LabelFrame(dialog, text="Restore")
+        scope_frame.pack(padx=12, pady=(8, 0), fill="x")
+        for value, label in (
+            ("all", "Everything in the backup"),
+            ("world", "World only -- keeps current player progress"),
+            ("players", "Players only -- keeps current terrain"),
+        ):
+            ttk.Radiobutton(scope_frame, text=label, value=value,
+                            variable=scope_var).pack(anchor="w", padx=8, pady=1)
+        scope_note = ttk.Label(dialog, text="", foreground="#666666", wraplength=660,
+                               justify="left")
+        scope_note.pack(padx=12, pady=(4, 0), anchor="w")
+
+        def describe_scope(*_a):
+            bset = set_by_iid.get(tree.selection()[0]) if tree.selection() else None
+            folders = ", ".join(sorted(bset.members)) if bset else "the world folder(s)"
+            scope = scope_var.get()
+            if scope == "all":
+                text = (f"Replaces {folders} entirely. The current copy is kept as "
+                        f"<folder>.old-<stamp> until every archive has landed, then "
+                        f"deleted.")
+            elif scope == "world":
+                text = (f"Overwrites everything in {folders} except playerdata/, "
+                        f"players/, stats/ and advancements/. Files not in the backup "
+                        f"are left alone.")
+            else:
+                text = (f"Overwrites only playerdata/, players/, stats/ and "
+                        f"advancements/ inside {folders}. Files not in the backup are "
+                        f"left alone.")
+            scope_note.config(text=text)
+
+        scope_var.trace_add("write", describe_scope)
+        describe_scope()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(padx=12, pady=12, fill="x")
+        ttk.Button(btn_frame, text="Cancel",
+                   command=dialog.destroy).pack(side="right", padx=(6, 0))
+        restore_btn = ttk.Button(btn_frame, text="Roll Back", state="disabled")
+        restore_btn.pack(side="right")
+
+        def on_select(_event=None):
+            sel = tree.selection()
+            restore_btn.configure(
+                state="normal" if sel and sel[0] in ok_iids else "disabled")
+            describe_scope()
+
+        def do_restore():
+            sel = tree.selection()
+            if not sel or sel[0] not in ok_iids:
+                return
+            bset = set_by_iid[sel[0]]
+            if self._confirm_and_start_world_restore(info, bset, scope_var.get()):
+                dialog.destroy()
+
+        restore_btn.configure(command=do_restore)
+        tree.bind("<<TreeviewSelect>>", on_select)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        self._center_over_main_window(dialog)
+
+    def _confirm_and_start_world_restore(self, info: ServerInfo, bset, scope: str) -> bool:
+        """Confirm, optionally take a safety backup, then run the restore on
+        a worker thread. Returns True if the restore was started."""
+        live = server_looks_live(info)
+        if live and not messagebox.askyesno(
+            "Server May Be Running",
+            f"{live}\n\n"
+            "This check is a guess -- a recently-touched session.lock does not "
+            "prove the server is up, and a stopped server can still look busy. "
+            "But if it IS running, it holds the world open and will write over "
+            "whatever is restored, usually within seconds.\n\n"
+            "Continue anyway?",
+            default="no",
+        ):
+            return False
+
+        missing = bset.missing_folders(info)
+        scope_text = {"all": "everything", "world": "world files only",
+                      "players": "player files only"}[scope]
+        lines = [
+            f"Roll {info.level_name} back to the backup dated {bset.display_date()}?",
+            "",
+            f"Made by:   {bset.provider_name}",
+            f"Restoring: {scope_text}",
+            f"Archives:  {', '.join(sorted(bset.members))}",
+        ]
+        if missing:
+            lines += ["",
+                      "WARNING: this backup has no archive for " + ", ".join(missing) +
+                      ". Those dimensions will be left as they are, which may leave "
+                      "the world inconsistent."]
+        lines += ["", "This overwrites the live world."]
+        if not messagebox.askyesno("Roll Back World", "\n".join(lines)):
+            return False
+
+        safety_dir = resolve_backup_convention(info, "safety").directory
+        safety = messagebox.askyesnocancel(
+            "Safety Backup",
+            "Back up the current world first?\n\n"
+            "Strongly recommended -- without it the current world cannot be "
+            f"recovered after this restore.\n\n"
+            f"It goes to {safety_dir}, which is ours alone: unlike a normal "
+            "backup it does not follow the installed tool's naming, so that "
+            "tool's retention can never prune it.")
+        if safety is None:
+            return False
+        if safety:
+            try:
+                create_world_backup(info, purpose="safety")
+            except Exception as e:
+                messagebox.showerror(
+                    "Safety Backup Failed",
+                    f"Could not back up the current world:\n\n{e}\n\n"
+                    "The rollback has been cancelled.")
+                return False
+        elif not messagebox.askyesno(
+            "No Safety Backup",
+            "Continue without a safety backup?\n\n"
+            "The current state of this world will be gone for good."
+        ):
+            return False
+
+        cancel_event = threading.Event()
+        self._restore_progress = self._open_progress_dialog(
+            "Rolling Back", f"Restoring {info.level_name}...", cancel_event)
+
+        def worker():
+            try:
+                result = restore_backup_set(
+                    info, bset, scope,
+                    progress_cb=lambda n, name: self.task_queue.put(
+                        ("restore_progress", (n, name))),
+                    cancel_event=cancel_event)
+                self.task_queue.put(("restore_done", (info, result, None)))
+            except ExportCancelled:
+                self.task_queue.put(("restore_done", (info, None, None)))
+            except Exception as e:
+                self.task_queue.put(("restore_done", (info, None, e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _finish_world_restore(self, info: ServerInfo, result, error):
+        if error is not None:
+            messagebox.showerror(
+                "Rollback Failed",
+                f"{error}\n\nAny folders already swapped have been put back.")
+            return
+        if result is None:
+            self.status_var.set("Rollback cancelled")
+            return
+        # Version, seed, players and even the detected platform can all change
+        # after a restore -- a backup taken on Spigot restored onto Paper now
+        # reads as a conflict, which is correct and worth showing.
+        self._rescan_single_server(info)
+        self.status_var.set(
+            f"Restored {', '.join(result['restored'])} -- {result['files']} files")
+
+    def _rescan_single_server(self, info: ServerInfo):
+        """Re-detect one server in place and refresh the UI for it."""
+        try:
+            fresh = detect_server(info.path)
+        except Exception:
+            return
+        for iid, existing in self.tree_index.items():
+            if existing is info:
+                self.tree_index[iid] = fresh
+                self.tree.item(iid, text=fresh.name, values=(
+                    ", ".join(fresh.tags), fresh.last_log_date, fresh.difficulty))
+                for i, s in enumerate(self.servers):
+                    if s is info:
+                        self.servers[i] = fresh
+                if self.current_server is info:
+                    self.tree.selection_set(iid)
+                    self.on_select_server(None)
+                break
+
+    def _open_progress_dialog(self, title: str, message: str, cancel_event):
+        """Small modal progress window with a Cancel button. Returns a dict
+        holding the widgets so the queue handler can update and close it."""
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        label = ttk.Label(dialog, text=message, width=52)
+        label.pack(padx=14, pady=(14, 6), anchor="w")
+        detail = ttk.Label(dialog, text="", foreground="#666666", width=52)
+        detail.pack(padx=14, pady=(0, 8), anchor="w")
+        bar = ttk.Progressbar(dialog, mode="indeterminate", length=340)
+        bar.pack(padx=14, pady=(0, 8))
+        bar.start(12)
+        ttk.Button(dialog, text="Cancel",
+                   command=cancel_event.set).pack(padx=14, pady=(0, 12), anchor="e")
+        # Closing the window means the same thing as pressing Cancel; the
+        # worker thread is what actually stops.
+        dialog.protocol("WM_DELETE_WINDOW", cancel_event.set)
+        self._center_over_main_window(dialog)
+        return {"dialog": dialog, "label": label, "detail": detail, "bar": bar}
+
+    def _close_progress_dialog(self, progress):
+        if not progress:
+            return
+        try:
+            progress["bar"].stop()
+            progress["dialog"].grab_release()
+            progress["dialog"].destroy()
+        except tk.TclError:
+            pass
 
     # -- World export ---------------------------------------------------------
 
@@ -3393,22 +4832,31 @@ class App(tk.Tk):
         tree.pack(padx=12, fill="both", expand=True)
 
         matches_by_iid = {}
-        path_by_iid = {}
-        for entry in backups:
-            display_date = entry.dt.strftime("%Y-%m-%d %H:%M") if entry.dt else entry.path.name
-            iid = tree.insert("", "end", text=display_date, values=("Checking...",))
-            path_by_iid[iid] = entry
+        set_by_iid = {}
+        for bset in backups:
+            iid = tree.insert("", "end", text=bset.display_date(), values=("Checking...",))
+            set_by_iid[iid] = bset
+            if not bset.restorable:
+                tree.item(iid, values=("Read-only backup",), tags=("unavailable",))
 
         result_queue: "queue.Queue" = queue.Queue()
 
         def scan_worker():
-            for iid, entry in path_by_iid.items():
-                try:
-                    with zipfile.ZipFile(entry.path) as zf:
-                        matches = find_uuid_entries_in_zip(zf, p.uuid)
-                except (OSError, zipfile.BadZipFile):
-                    matches = []
-                result_queue.put((iid, matches))
+            for iid, bset in set_by_iid.items():
+                if not bset.restorable:
+                    continue
+                # Search every archive in the set, not just the first: on a
+                # split world the player files live in the overworld archive,
+                # and which one that is depends on the provider's naming.
+                hits = []
+                for member in bset.members.values():
+                    archive = open_backup_archive(member.path)
+                    if archive is None:
+                        continue
+                    with archive:
+                        for name in archive.player_file_entries(p.uuid):
+                            hits.append((member.path, name, archive.rel(name)))
+                result_queue.put((iid, hits))
 
         threading.Thread(target=scan_worker, daemon=True).start()
 
@@ -3417,10 +4865,12 @@ class App(tk.Tk):
                 return
             try:
                 while True:
-                    iid, matches = result_queue.get_nowait()
-                    if matches:
-                        matches_by_iid[iid] = matches
-                        tree.item(iid, values=("Available",), tags=("available",))
+                    iid, hits = result_queue.get_nowait()
+                    if hits:
+                        matches_by_iid[iid] = hits
+                        tree.item(iid, values=(f"Available ({len(hits)} file"
+                                               f"{'s' if len(hits) != 1 else ''})",),
+                                  tags=("available",))
                     else:
                         tree.item(iid, values=("Player not found",), tags=("unavailable",))
             except queue.Empty:
@@ -3444,9 +4894,8 @@ class App(tk.Tk):
             matches = matches_by_iid.get(iid)
             if not matches:
                 return
-            entry = path_by_iid[iid]
-            display_date = entry.dt.strftime("%Y-%m-%d %H:%M") if entry.dt else entry.path.name
-            if self._perform_rollback(info, p, entry.path, matches, display_date):
+            bset = set_by_iid[iid]
+            if self._perform_rollback(info, p, matches, bset.display_date()):
                 dialog.destroy()
 
         rollback_btn.configure(command=do_rollback)
@@ -3466,12 +4915,14 @@ class App(tk.Tk):
         self._center_over_main_window(dialog)
 
     def _perform_rollback(
-        self, info: ServerInfo, p: PlayerInfo, backup_path: Path, matches: list, display_date: str
+        self, info: ServerInfo, p: PlayerInfo, matches: list, display_date: str
     ) -> bool:
-        """Restore the given player's playerdata file(s) from inside a
-        backup zip, overwriting the live copies. Returns True on success (so
-        the caller can close the Roll Back dialog), False if the user
-        cancelled or the restore failed."""
+        """Restore one player's files from a backup, overwriting the live
+        copies. `matches` is a list of (archive path, entry name, path within
+        the world) tuples, which may span several archives in a set.
+
+        Returns True on success so the caller can close the dialog, False if
+        the user cancelled or it failed."""
         if len(matches) > 1:
             choice = messagebox.askyesnocancel(
                 "Multiple Files Found",
@@ -3483,10 +4934,11 @@ class App(tk.Tk):
             if choice is None:
                 return False
             if not choice:
-                main = next((m for m in matches if Path(m).name == f"{p.uuid}.dat"), None)
+                main = next((m for m in matches
+                             if m[2].rsplit("/", 1)[-1] == f"{p.uuid}.dat"), None)
                 matches = [main] if main else matches[:1]
 
-        file_list = "\n".join(sorted(Path(m).name for m in matches))
+        file_list = "\n".join(sorted(m[2] for m in matches))
         if not messagebox.askyesno(
             "Roll Back Playerdata",
             f"Restore playerdata for {p.name} from the backup dated {display_date}?\n\n"
@@ -3495,11 +4947,24 @@ class App(tk.Tk):
         ):
             return False
 
+        # The destination follows the *live* world's layout, not the
+        # archive's: a backup taken before 26.x carries playerdata/, and this
+        # server may now keep the same files under players/data/.
+        dest_dir = get_playerdata_dir(info)
         try:
-            with zipfile.ZipFile(backup_path) as zf:
-                for name in matches:
-                    data = zf.read(name)
-                    (get_playerdata_dir(info) / Path(name).name).write_bytes(data)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            by_archive = {}
+            for archive_path, name, rel in matches:
+                by_archive.setdefault(archive_path, []).append((name, rel))
+            for archive_path, items in by_archive.items():
+                archive = open_backup_archive(archive_path)
+                if archive is None:
+                    raise OSError(f"{archive_path.name} is not a readable archive")
+                with archive:
+                    for name, rel in items:
+                        out = dest_dir / rel.rsplit("/", 1)[-1]
+                        with archive.open(name) as src, open(out, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
         except (OSError, zipfile.BadZipFile) as e:
             messagebox.showerror("Error", f"Could not restore playerdata: {e}")
             return False

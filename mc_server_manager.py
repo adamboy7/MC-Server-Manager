@@ -874,6 +874,115 @@ def default_op_level(info: "ServerInfo") -> int:
         return 4
 
 
+# ---------------------------------------------------------------------------
+# Opening a text file in whatever editor the user already has
+#
+# Windows will happily "open" an unassociated extension by popping the
+# "How do you want to open this file?" picker rather than failing, so
+# os.startfile() inside a try/except is not a usable test for whether an
+# association exists -- by the time it returns, the user is already looking at
+# a dialog we didn't want. Ask the association database first instead, and
+# only launch once we know a real handler is registered.
+# ---------------------------------------------------------------------------
+
+ASSOCF_VERIFY = 0x00000040   # make the shell confirm the handler still exists
+ASSOCSTR_EXECUTABLE = 2      # "the executable this extension opens with"
+
+# What AssocQueryStringW hands back when nothing real is registered. These are
+# the shell's own "ask the user" shims, not editors -- launching one is the
+# picker dialog we're trying to avoid.
+NON_HANDLER_EXECUTABLES = {"openwith.exe", "rundll32.exe", "shell32.dll"}
+
+
+def windows_associated_executable(ext: str) -> Optional[str]:
+    """Path to the executable registered to open `ext` (e.g. ".properties"),
+    or None if there is no usable association.
+
+    Uses shlwapi's AssocQueryStringW rather than shelling out to assoc/ftype:
+    no console window flash, and no parsing of locale-dependent output."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        shlwapi = ctypes.WinDLL("shlwapi", use_last_error=True)
+        query = shlwapi.AssocQueryStringW
+        query.restype = ctypes.c_long
+        query.argtypes = [
+            ctypes.c_uint32, ctypes.c_uint32, wintypes.LPCWSTR,
+            wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(ctypes.c_uint32),
+        ]
+        size = ctypes.c_uint32(1024)
+        buf = ctypes.create_unicode_buffer(size.value)
+        hr = query(ASSOCF_VERIFY, ASSOCSTR_EXECUTABLE, ext, None, buf,
+                   ctypes.byref(size))
+    except (ImportError, OSError, AttributeError, ValueError):
+        # No ctypes, no shlwapi, or an unexpected calling convention. Callers
+        # have a fallback chain; this just means "we couldn't ask".
+        return None
+    if hr != 0:
+        return None
+    exe = buf.value.strip()
+    if not exe or Path(exe).name.lower() in NON_HANDLER_EXECUTABLES:
+        return None
+    return exe
+
+
+def open_in_text_editor(path: Path) -> str:
+    """Open `path` in whatever text editor the user already has, and return a
+    short human-readable name for whichever route worked (for the status bar).
+
+    Three steps, most-preferred first:
+      1. a real handler for the file's own extension -- if someone has mapped
+         .properties to VS Code or IntelliJ, that wins;
+      2. the .txt handler, launched with the file as an argument. Not
+         os.startfile, which would re-resolve the original extension and land
+         back at step 1;
+      3. notepad.exe, which is always present on Windows.
+
+    Raises OSError if every route fails."""
+    path = Path(path)
+    errors = []
+
+    if os.name == "nt":
+        own_ext = path.suffix or ".txt"
+        if windows_associated_executable(own_ext):
+            try:
+                os.startfile(str(path))
+                return "the default handler"
+            except OSError as e:
+                # A stale association pointing at an uninstalled app: the
+                # query succeeded but the launch didn't. Fall through.
+                errors.append(f"{own_ext} handler: {e}")
+
+        txt_exe = windows_associated_executable(".txt")
+        if txt_exe:
+            try:
+                subprocess.Popen([txt_exe, str(path)])
+                return Path(txt_exe).stem
+            except OSError as e:
+                errors.append(f".txt handler: {e}")
+
+        try:
+            subprocess.Popen(["notepad.exe", str(path)])
+            return "Notepad"
+        except OSError as e:
+            errors.append(f"notepad.exe: {e}")
+    else:
+        # The rest of the app is Windows-bound (explorer, Segoe UI), so this
+        # branch is a courtesy rather than a supported path -- it is here so
+        # the function degrades to a clear error instead of an AttributeError
+        # on os.startfile. Unverified.
+        for opener in ("xdg-open", "open"):
+            try:
+                subprocess.Popen([opener, str(path)])
+                return opener
+            except OSError as e:
+                errors.append(f"{opener}: {e}")
+
+    raise OSError("; ".join(errors) or "no way to open the file was found")
+
+
 def server_looks_live(info: "ServerInfo") -> Optional[str]:
     """Best-effort check for whether the server appears to be running right
     now. Returns a human-readable reason if so, else None -- callers decide
@@ -2694,6 +2803,7 @@ class App(tk.Tk):
         lives in the world's level.dat, not server.properties, so saving it
         rewrites a binary world file rather than a line of text."""
         props = read_server_properties(info.path)
+        props_path = info.path / "server.properties"
         allow_cheats_initial = read_allow_commands(info)
         level_dat = get_level_dat_path(info)
         level_dat_present = level_dat.is_file()
@@ -2739,21 +2849,37 @@ class App(tk.Tk):
             tip += " (this world has no allowCommands tag yet -- one will be added)"
         Tooltip(cheats_box, tip)
 
+        def pending_changes():
+            """Toggles that differ from what was on disk when this dialog
+            opened. Drives the prompt in on_edit_properties -- without it,
+            launching an external editor over unsaved toggles is a lost
+            update in whichever direction the user saves second."""
+            changed = [
+                label for key, label in toggles
+                if vars_by_key[key].get() != parse_bool_property(props, key)
+            ]
+            if level_dat_present and cheats_var.get() != bool(allow_cheats_initial):
+                changed.append("Allow Cheats (level.dat)")
+            return changed
+
         def on_save(event=None):
+            """Returns True if everything asked for was written. The return
+            value matters to on_edit_properties, which must not launch the
+            editor after a save the user cancelled."""
             cheats_changed = (
                 level_dat_present and cheats_var.get() != bool(allow_cheats_initial)
             )
             if cheats_changed and not self._confirm_cheats_change(
                 info, level_dat, cheats_var.get(), allow_cheats_initial
             ):
-                return
+                return False
 
             updates = {key: ("true" if var.get() else "false") for key, var in vars_by_key.items()}
             try:
                 update_server_properties(info.path, updates)
             except OSError as e:
                 messagebox.showerror("Error", f"Could not write server.properties: {e}")
-                return
+                return False
 
             # server.properties is already saved at this point, so a level.dat
             # failure below reports itself but doesn't roll anything back --
@@ -2775,7 +2901,7 @@ class App(tk.Tk):
                         f"Saved server.properties, but could not write level.dat: {e}",
                     )
                     dialog.destroy()
-                    return
+                    return False
                 state = "enabled" if cheats_var.get() else "disabled"
                 cheats_note = f", cheats {state}"
                 if outcome == "inserted":
@@ -2783,12 +2909,70 @@ class App(tk.Tk):
 
             dialog.destroy()
             self.status_var.set(f"Updated settings for {info.name}{cheats_note}")
+            return True
+
+        def on_edit_properties(event=None):
+            """Hand server.properties to a real text editor for the settings
+            this dialog's four checkboxes don't cover.
+
+            The dialog always closes on the way out, whether or not anything
+            was saved. Leaving it open would let a later Save write the four
+            toggles back over whatever the user just edited externally, and
+            the dialog re-reads properties on every open anyway -- so
+            reopening it after the edit shows the new values."""
+            pending = pending_changes()
+            if pending:
+                answer = messagebox.askyesnocancel(
+                    "Unsaved Changes",
+                    "These toggles haven't been saved yet:\n\n  "
+                    + "\n  ".join(pending)
+                    + "\n\nSave them before opening server.properties?\n\n"
+                    "Choose No to discard them and edit the file as it is "
+                    "on disk.",
+                    parent=dialog,
+                )
+                if answer is None:
+                    return
+                if answer:
+                    if not on_save():
+                        # Save failed, or the cheats confirmation was
+                        # declined. Leave the dialog up so the user can see
+                        # what state things are in.
+                        return
+                else:
+                    dialog.destroy()
+            else:
+                dialog.destroy()
+
+            try:
+                opened_with = open_in_text_editor(props_path)
+            except OSError as e:
+                if messagebox.askyesno(
+                    "Could Not Open Editor",
+                    f"Couldn't open server.properties in a text editor:\n\n{e}\n\n"
+                    "Show the file in Explorer instead?",
+                ):
+                    self._reveal_in_explorer(props_path)
+                return
+            self.status_var.set(
+                f"Opened server.properties for {info.name} in {opened_with}"
+            )
 
         def on_cancel(event=None):
             dialog.destroy()
 
         btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(padx=12, pady=(8, 12), anchor="e")
+        # fill="x" rather than anchor="e" so the frame spans the dialog and
+        # Edit Properties can sit genuinely apart from the Cancel/Save pair
+        # instead of just being packed first next to them.
+        btn_frame.pack(padx=12, pady=(8, 12), fill="x")
+        edit_btn = ttk.Button(btn_frame, text="Edit Properties...", command=on_edit_properties)
+        edit_btn.pack(side="left")
+        if not props_path.is_file():
+            edit_btn.configure(state="disabled")
+            Tooltip(edit_btn, f"No server.properties in {info.path.name}")
+        else:
+            Tooltip(edit_btn, "Open server.properties in your text editor")
         ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="right", padx=(6, 0))
         ttk.Button(btn_frame, text="Save", command=on_save).pack(side="right")
 
@@ -3105,6 +3289,12 @@ class App(tk.Tk):
         if not dat_file.exists():
             messagebox.showwarning("File Not Found", f"{dat_file.name} no longer exists.")
             return
+        self._reveal_in_explorer(dat_file)
+
+    def _reveal_in_explorer(self, target: Path):
+        """Open Explorer with `target` selected. Reports its own failure --
+        every caller reaches this as a "show me where it is" convenience, not
+        as the operation they actually asked for."""
         try:
             # explorer.exe parses its command line itself rather than via
             # normal argv, and expects the path immediately after the comma,
@@ -3115,7 +3305,7 @@ class App(tk.Tk):
             # to its default window instead of erroring. Passing a single
             # string sidesteps list2cmdline and gives explorer exactly the
             # command line it expects.
-            subprocess.run(f'explorer /select,"{dat_file}"')
+            subprocess.run(f'explorer /select,"{target}"')
         except OSError as e:
             messagebox.showerror("Error", f"Could not open Explorer: {e}")
 

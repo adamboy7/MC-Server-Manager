@@ -665,11 +665,48 @@ def _iter_backup_archive_files(folder: Path):
         return
 
 
+def world_folder_allowlist(info: "ServerInfo") -> dict:
+    """The only folder names a restore may ever write into, keyed by a
+    case-folded lookup name.
+
+    This exists because an archive's *filename* is not a fact about this
+    server. "plugins_2026-08-21_10-00-00.zip" parses as cleanly as
+    "world_nether_2026-08-21_10-00-00.zip", and without this check a restore
+    would replace the plugins folder wholesale."""
+    names = [info.level_name,
+             f"{info.level_name}_nether",
+             f"{info.level_name}_the_end"]
+    return {n.casefold(): n for n in names}
+
+
+def resolve_member_target(world_name: str, info: "ServerInfo",
+                          provider: str) -> Optional[str]:
+    """Which folder an archive named `world_name` may be restored into, or
+    None if it may not be restored at all.
+
+    Three cases:
+      * it names one of this world's folders  -> that folder;
+      * it didn't parse as a dated archive at all (a hand-renamed file) ->
+        the overworld, which is the only sensible target for a loose backup
+        and matches what this app did before restores existed;
+      * it names some *other* world (a multiworld server's second world, or
+        a stray zip that merely matches the naming grammar) -> None.
+    """
+    allow = world_folder_allowlist(info)
+    target = allow.get(world_name.casefold())
+    if target is not None:
+        return target
+    if provider == "unknown":
+        return info.level_name
+    return None
+
+
 @dataclass
 class BackupMember:
     path: Path
     world_folder: str
     size_bytes: int = 0
+    target_folder: Optional[str] = None
 
 
 @dataclass
@@ -752,6 +789,9 @@ def list_world_backups(info: "ServerInfo") -> list:
                 provider = folder_provider
             elif parsed.provider == "unknown" and folder_provider:
                 provider = folder_provider
+            target = resolve_member_target(parsed.world, info, parsed.provider)
+            if target is None:
+                continue
             key = (provider, parsed.stamp)
             bset = sets.get(key)
             if bset is None:
@@ -762,8 +802,8 @@ def list_world_backups(info: "ServerInfo") -> list:
             except OSError:
                 size = 0
             bset.members.setdefault(
-                parsed.world, BackupMember(path=fp, world_folder=parsed.world,
-                                           size_bytes=size))
+                target, BackupMember(path=fp, world_folder=parsed.world,
+                                     size_bytes=size, target_folder=target))
     out = sorted(sets.values(), key=lambda s: s.dt or datetime.min, reverse=True)
     return out
 
@@ -857,13 +897,14 @@ def resolve_backup_convention(info: "ServerInfo",
 
 def _archive_world_folder(src: Path, dest_part: Path, arc_prefix: str,
                           kind: str = "zip", progress_cb=None,
-                          cancel_event=None) -> int:
-    """Archive one world folder to dest_part. Returns files written.
+                          cancel_event=None) -> tuple:
+    """Archive one world folder to dest_part. Returns (files written, skipped).
 
     Always writes forward slashes, even when mimicking AutoBackup: its
     backslashes are out of spec, nothing reads ours by path except us, and
     the retention we are blending in with is filename-based."""
     count = 0
+    skipped = []
     if kind == "zip":
         container = zipfile.ZipFile(dest_part, "w", zipfile.ZIP_DEFLATED)
         add = lambda src_file, arcname: container.write(src_file, arcname)
@@ -880,14 +921,13 @@ def _archive_world_folder(src: Path, dest_part: Path, arc_prefix: str,
             arcname = arc_prefix + rel_path.as_posix()
             try:
                 add(abs_path, arcname)
-            except OSError:
-                # A file that vanished or can't be read mid-walk shouldn't
-                # abort a backup of everything else.
+            except (OSError, ValueError):
+                skipped.append(rel_path.as_posix())
                 continue
             count += 1
             if progress_cb is not None:
                 progress_cb(count, abs_path.name)
-    return count
+    return count, skipped
 
 
 def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
@@ -903,7 +943,6 @@ def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
     dt = dt or datetime.now()
     convention = resolve_backup_convention(info, purpose)
     target = convention.target_dir(info.level_name, dt)
-    target.mkdir(parents=True, exist_ok=True)
 
     folders = [(info.level_name, get_world_dir(info))]
     if has_satellite_dimension_folders(info):
@@ -919,23 +958,29 @@ def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
     # and orphan the set from its siblings.
     step = 60 if convention.provider in ("aroma3", "aroma0") else 1
     for _ in range(120):
+        target = convention.target_dir(info.level_name, dt)
         names = [convention.archive_name(n, dt) for n, _ in folders]
         if not any((target / n).exists() for n in names):
             break
         dt = dt + timedelta(seconds=step)
-        target = convention.target_dir(info.level_name, dt)
+    else:
+        raise OSError(
+            f"could not find a free backup name near {dt:%Y-%m-%d %H:%M:%S} "
+            f"in {target} -- 120 consecutive slots are already taken")
+    target.mkdir(parents=True, exist_ok=True)
 
-    parts, finals = [], []
+    parts, finals, skipped = [], [], []
     try:
         for world_folder, src in folders:
             name = convention.archive_name(world_folder, dt)
             final = target / name
             part = target / (name + ".part")
             prefix = f"{world_folder}/" if convention.nested else ""
-            _archive_world_folder(src, part, prefix, convention.kind,
-                                  progress_cb, cancel_event)
             parts.append(part)
             finals.append(final)
+            _n, part_skipped = _archive_world_folder(
+                src, part, prefix, convention.kind, progress_cb, cancel_event)
+            skipped.extend(f"{world_folder}/{s}" for s in part_skipped)
     except BaseException:
         for part in parts:
             try:
@@ -948,6 +993,10 @@ def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
         os.replace(part, final)
 
     _write_backup_sidecar(info, convention, target, finals, dt)
+    if skipped:
+        create_world_backup.last_skipped = skipped
+    else:
+        create_world_backup.last_skipped = []
     return finals
 
 
@@ -1008,6 +1057,12 @@ def _write_backup_sidecar(info: "ServerInfo", convention: BackupConvention,
 # Restoring
 # ---------------------------------------------------------------------------
 
+class RestoreRevertError(Exception):
+    """A restore failed *and* the original could not be moved back. Carries
+    the paths the untouched world is sitting under, because that is the one
+    thing the user has to be told."""
+
+
 RESTORE_SCOPES = ("all", "world", "players")
 
 # Folders inside a world that hold per-player state, in both layouts. An
@@ -1035,10 +1090,30 @@ def restore_backup_set(info: "ServerInfo", bset: "BackupSet", scope: str = "all"
     if scope not in RESTORE_SCOPES:
         raise ValueError(f"unknown restore scope: {scope}")
 
+    allow = world_folder_allowlist(info)
     targets = []
-    for world_folder, member in sorted(bset.members.items()):
-        dest = info.path / world_folder
-        targets.append((world_folder, member, dest))
+    seen_dest = {}
+    for key, member in sorted(bset.members.items()):
+        folder = member.target_folder or key
+        if folder.casefold() not in allow:
+            raise ValueError(
+                f"refusing to restore into {folder!r}: it is not one of "
+                f"{info.level_name}'s world folders")
+        folder = allow[folder.casefold()]
+        dest = info.path / folder
+        try:
+            resolved = dest.resolve()
+        except OSError:
+            resolved = dest
+        if resolved in seen_dest:
+            raise ValueError(
+                f"this backup has two archives for {folder!r} "
+                f"({seen_dest[resolved].name} and {member.path.name}) -- "
+                "restoring it could destroy the folder it set aside")
+        seen_dest[resolved] = member.path
+        targets.append((folder, member, dest))
+    if not targets:
+        raise ValueError("this backup has no archives that belong to this world")
 
     stamp = bset.stamp.replace(":", "-").replace(" ", "_")
     temp_dirs, swapped = [], []
@@ -1095,8 +1170,8 @@ def restore_backup_set(info: "ServerInfo", bset: "BackupSet", scope: str = "all"
                     if old.exists():
                         shutil.rmtree(old, ignore_errors=True)
                     os.replace(dest, old)
-                os.replace(tmp, dest)
                 swapped.append((dest, old))
+                os.replace(tmp, dest)
             else:
                 for src_file in tmp.rglob("*"):
                     if src_file.is_dir():
@@ -1107,18 +1182,27 @@ def restore_backup_set(info: "ServerInfo", bset: "BackupSet", scope: str = "all"
                     shutil.copy2(src_file, out)
                 shutil.rmtree(tmp, ignore_errors=True)
         temp_dirs = [t for t in temp_dirs if t.exists()]
-    except BaseException:
-        # Put back anything already swapped, newest first.
+    except BaseException as exc:
+        stranded = []
         for dest, old in reversed(swapped):
+            if old is None:
+                continue
             try:
-                if old is not None:
-                    if dest.exists():
-                        shutil.rmtree(dest, ignore_errors=True)
-                    os.replace(old, dest)
+                if dest.exists():
+                    shutil.rmtree(dest)
+                os.replace(old, dest)
             except OSError:
-                pass
+                stranded.append(old)
         for tmp in temp_dirs:
             shutil.rmtree(tmp, ignore_errors=True)
+        if stranded:
+            raise RestoreRevertError(
+                f"{exc}\n\nThe rollback failed and the original could not be "
+                "put back automatically. Nothing has been deleted -- your "
+                "world is intact under:\n\n"
+                + "\n".join(f"    {p}" for p in stranded)
+                + "\n\nRename it back before starting the server, or the "
+                  "server will generate a new empty world.") from exc
         raise
 
     for _dest, old in swapped:

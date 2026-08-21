@@ -59,6 +59,7 @@ except ImportError:
 
 
 from mcsm.backups import (
+    RestoreRevertError,
     backup_search_dirs,
     create_world_backup,
     detect_backup_providers,
@@ -101,6 +102,7 @@ from mcsm.util import (
     compute_folder_size,
     format_size,
 )
+from mcsm.runstate import check_server_running
 from mcsm.world import (
     ALLOW_COMMANDS_PATH,
     ExportCancelled,
@@ -113,7 +115,6 @@ from mcsm.world import (
     has_satellite_dimension_folders,
     plan_world_export,
     read_allow_commands,
-    server_looks_live,
 )
 
 FACE_URL_TEMPLATES = [
@@ -512,10 +513,10 @@ class App(tk.Tk):
                         except tk.TclError:
                             pass
                 elif kind == "restore_done":
-                    info, result, error = payload
+                    info, result, error, scope = payload
                     self._close_progress_dialog(getattr(self, "_restore_progress", None))
                     self._restore_progress = None
-                    self._finish_world_restore(info, result, error)
+                    self._finish_world_restore(info, result, error, scope)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -638,10 +639,13 @@ class App(tk.Tk):
             lines += ["",
                       f"This follows {matching.name}'s naming, so it will sit "
                       f"alongside its archives -- and {note} applies to this one too."]
-        live = server_looks_live(info)
-        if live:
-            lines += ["", f"WARNING: {live}",
+        run = check_server_running(info)
+        if run.is_running:
+            lines += ["", f"WARNING: {run.reason}",
                       "A backup taken while the server is writing may be inconsistent."]
+        elif run.severity == "caution":
+            lines += ["", run.reason,
+                      "If it is running, this backup may be inconsistent."]
         if not messagebox.askyesno("Create Backup", "\n".join(lines)):
             return
 
@@ -723,17 +727,23 @@ class App(tk.Tk):
             for iid, bset in set_by_iid.items():
                 if not bset.restorable:
                     continue
-                problems = []
-                for folder, member in sorted(bset.members.items()):
-                    archive = open_backup_archive(member.path)
-                    if archive is None:
-                        problems.append(f"{member.path.name} is unreadable")
-                        continue
-                    with archive:
-                        reason = archive.incremental_reason()
-                        if reason:
-                            problems.append(f"{folder}: {reason}")
-                missing = bset.missing_folders(info)
+                try:
+                    problems = []
+                    for folder, member in sorted(bset.members.items()):
+                        archive = open_backup_archive(member.path)
+                        if archive is None:
+                            problems.append(f"{member.path.name} is unreadable")
+                            continue
+                        try:
+                            with archive:
+                                reason = archive.incremental_reason()
+                                if reason:
+                                    problems.append(f"{folder}: {reason}")
+                        except Exception as e:
+                            problems.append(f"{folder}: cannot be read ({e})")
+                    missing = bset.missing_folders(info)
+                except Exception as e:
+                    problems, missing = [f"scan failed: {e}"], []
                 result_queue.put((iid, problems, missing))
 
         threading.Thread(target=scan_worker, daemon=True).start()
@@ -829,15 +839,23 @@ class App(tk.Tk):
     def _confirm_and_start_world_restore(self, info: ServerInfo, bset, scope: str) -> bool:
         """Confirm, optionally take a safety backup, then run the restore on
         a worker thread. Returns True if the restore was started."""
-        live = server_looks_live(info)
-        if live and not messagebox.askyesno(
-            "Server May Be Running",
-            f"{live}\n\n"
-            "This check is a guess -- a recently-touched session.lock does not "
-            "prove the server is up, and a stopped server can still look busy. "
-            "But if it IS running, it holds the world open and will write over "
-            "whatever is restored, usually within seconds.\n\n"
-            "Continue anyway?",
+        run = check_server_running(info)
+        if run.severity == "block":
+            messagebox.showerror(
+                "Server Is Running",
+                f"{run.reason}\n\n"
+                "A running server holds the world open and will write over "
+                "whatever is restored, usually within seconds.\n\n"
+                "Stop the server and try again.")
+            return False
+        if run.severity == "caution" and not messagebox.askyesno(
+            "Could Not Confirm The Server Is Stopped",
+            f"{run.reason}\n\n"
+            "That does not mean it is running -- a server that was killed "
+            "rather than shut down cleanly looks exactly like this, and a "
+            "world on a network share or in a container can be locked by a "
+            "process this machine cannot see.\n\n"
+            "Continue with the rollback?",
             default="no",
         ):
             return False
@@ -857,6 +875,8 @@ class App(tk.Tk):
                       "WARNING: this backup has no archive for " + ", ".join(missing) +
                       ". Those dimensions will be left as they are, which may leave "
                       "the world inconsistent."]
+        if run.severity == "note":
+            lines += ["", run.reason]
         lines += ["", "This overwrites the live world."]
         if not messagebox.askyesno("Roll Back World", "\n".join(lines)):
             return False
@@ -873,13 +893,9 @@ class App(tk.Tk):
         if safety is None:
             return False
         if safety:
-            try:
-                create_world_backup(info, purpose="safety")
-            except Exception as e:
-                messagebox.showerror(
-                    "Safety Backup Failed",
-                    f"Could not back up the current world:\n\n{e}\n\n"
-                    "The rollback has been cancelled.")
+            if not self._run_blocking_backup(
+                    info, "Safety Backup", "Backing up the current world...",
+                    purpose="safety"):
                 return False
         elif not messagebox.askyesno(
             "No Safety Backup",
@@ -899,20 +915,32 @@ class App(tk.Tk):
                     progress_cb=lambda n, name: self.task_queue.put(
                         ("restore_progress", (n, name))),
                     cancel_event=cancel_event)
-                self.task_queue.put(("restore_done", (info, result, None)))
+                self.task_queue.put(("restore_done", (info, result, None, scope)))
             except ExportCancelled:
-                self.task_queue.put(("restore_done", (info, None, None)))
+                self.task_queue.put(("restore_done", (info, None, None, scope)))
             except Exception as e:
-                self.task_queue.put(("restore_done", (info, None, e)))
+                self.task_queue.put(("restore_done", (info, None, e, scope)))
 
         threading.Thread(target=worker, daemon=True).start()
         return True
 
-    def _finish_world_restore(self, info: ServerInfo, result, error):
+    def _finish_world_restore(self, info: ServerInfo, result, error, scope="all"):
         if error is not None:
-            messagebox.showerror(
-                "Rollback Failed",
-                f"{error}\n\nAny folders already swapped have been put back.")
+            if isinstance(error, RestoreRevertError):
+                messagebox.showerror("Rollback Failed - Action Needed", str(error))
+            elif scope == "all":
+                messagebox.showerror(
+                    "Rollback Failed",
+                    f"{error}\n\nAny folders already swapped have been put back.")
+            else:
+                messagebox.showerror(
+                    "Rollback Failed",
+                    f"{error}\n\nThis was a partial restore, which copies over "
+                    "the world in place -- some files may already have been "
+                    "replaced and cannot be undone automatically. Restore the "
+                    "whole backup, or use the safety backup taken before this "
+                    "started.")
+            self._rescan_single_server(info)
             return
         if result is None:
             self.status_var.set("Rollback cancelled")
@@ -942,6 +970,53 @@ class App(tk.Tk):
                     self.tree.selection_set(iid)
                     self.on_select_server(None)
                 break
+
+    def _run_blocking_backup(self, info: ServerInfo, title: str, message: str,
+                             purpose: str = "manual") -> bool:
+        """Take a backup on a worker thread while pumping the event loop, and
+        return whether it succeeded.
+
+        Used where the caller genuinely has to wait -- the pre-rollback safety
+        copy -- so the UI stays responsive and cancellable instead of locking
+        up for the length of a multi-gigabyte copy."""
+        cancel_event = threading.Event()
+        progress = self._open_progress_dialog(title, message, cancel_event)
+        outcome = {}
+
+        def worker():
+            try:
+                create_world_backup(info, purpose=purpose,
+                                    progress_cb=lambda n, name: progress_state
+                                    .__setitem__("text", f"{n} files -- {name[:44]}"),
+                                    cancel_event=cancel_event)
+                outcome["ok"] = True
+            except ExportCancelled:
+                outcome["cancelled"] = True
+            except Exception as e:
+                outcome["error"] = e
+
+        progress_state = {"text": ""}
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            try:
+                progress["detail"].config(text=progress_state["text"])
+            except tk.TclError:
+                pass
+            self.update()
+            thread.join(0.05)
+        self._close_progress_dialog(progress)
+
+        if outcome.get("error") is not None:
+            messagebox.showerror(
+                "Safety Backup Failed",
+                f"Could not back up the current world:\n\n{outcome['error']}\n\n"
+                "The rollback has been cancelled.")
+            return False
+        if outcome.get("cancelled"):
+            self.status_var.set("Safety backup cancelled -- rollback abandoned")
+            return False
+        return True
 
     def _open_progress_dialog(self, title: str, message: str, cancel_event):
         """Small modal progress window with a Cancel button. Returns a dict
@@ -1943,7 +2018,10 @@ class App(tk.Tk):
             "Roll Back Playerdata",
             f"Restore playerdata for {p.name} from the backup dated {display_date}?\n\n"
             f"This will overwrite the following live file(s):\n{file_list}\n\n"
-            "This cannot be undone.",
+            "This cannot be undone.\n\n"
+            f"If {p.name} is online right now, the server holds their data in "
+            "memory and will write it back over this on logout. Make sure they "
+            "are disconnected first -- the server itself can stay running.",
         ):
             return False
 
@@ -2140,10 +2218,10 @@ class App(tk.Tk):
         if p.is_bedrock:
             lines.append("")
             lines.append("This is a Bedrock/Geyser player -- the UUID is a Floodgate identifier, not a Mojang account.")
-        live_reason = server_looks_live(info)
-        if live_reason:
+        run = check_server_running(info)
+        if run.is_running:
             lines.append("")
-            lines.append(f"Warning: {live_reason} ops.json may be overwritten by the running server.")
+            lines.append(f"Warning: {run.reason} ops.json may be overwritten by the running server.")
         if not messagebox.askyesno("Op Player", "\n".join(lines)):
             return
         ops_path = get_ops_path(info)
@@ -2178,10 +2256,10 @@ class App(tk.Tk):
 
     def _deop_player(self, info: ServerInfo, p: PlayerInfo):
         lines = [f"Remove operator status from {p.name} ({p.uuid})?"]
-        live_reason = server_looks_live(info)
-        if live_reason:
+        run = check_server_running(info)
+        if run.is_running:
             lines.append("")
-            lines.append(f"Warning: {live_reason} ops.json may be overwritten by the running server.")
+            lines.append(f"Warning: {run.reason} ops.json may be overwritten by the running server.")
         if not messagebox.askyesno("Deop Player", "\n".join(lines)):
             return
         ops_path = get_ops_path(info)

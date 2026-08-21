@@ -160,35 +160,6 @@ def get_playerdata_dir_for_zip_match(name: str) -> bool:
     return parent.name == "data" and parent.parent.name == "players"
 
 
-def server_looks_live(info: "ServerInfo") -> Optional[str]:
-    """Best-effort check for whether the server appears to be running right
-    now. Returns a human-readable reason if so, else None -- callers decide
-    whether that's worth a warning or a hard block.
-
-    session.lock is held open by the server process for as long as it's up
-    and is rewritten on every world save, so a recently-touched lock file
-    plus a level.dat that can't be opened for reading is as close to "it's
-    running" as we can tell from outside the process."""
-    world_dir = get_world_dir(info)
-    lock_path = world_dir / "session.lock"
-    if not lock_path.exists():
-        return None
-    try:
-        age = time.time() - lock_path.stat().st_mtime
-    except OSError:
-        age = None
-    if age is not None and age > 300:
-        return None
-    try:
-        with open(world_dir / "level.dat", "rb"):
-            pass
-    except OSError:
-        return "level.dat can't currently be opened for reading -- the server is likely running."
-    if age is not None:
-        return "session.lock was updated recently -- the server may be running."
-    return None
-
-
 # ---------------------------------------------------------------------------
 # World export -- flattening the Bukkit split-world layout back to vanilla
 #

@@ -60,6 +60,7 @@ except ImportError:
 
 from mcsm.backups import (
     backup_folder_for_browsing,
+    has_any_backup_folder,
     backup_storage_dirs,
     backup_search_dirs,
     RestoreRevertError,
@@ -489,7 +490,7 @@ class App(tk.Tk):
                         except tk.TclError:
                             pass
                 elif kind == "backup_done":
-                    info, paths, error = payload
+                    info, paths, error, skipped = payload
                     self._close_progress_dialog(getattr(self, "_backup_progress", None))
                     self._backup_progress = None
                     if error is not None:
@@ -502,9 +503,19 @@ class App(tk.Tk):
                         info.backup_size_bytes = None
                         info.sizes_computed = False
                         names = ", ".join(p.name for p in paths)
+                        note = ""
+                        if skipped:
+                            note = (f" -- {len(skipped)} file"
+                                    f"{'s' if len(skipped) != 1 else ''} skipped")
+                            messagebox.showwarning(
+                                "Some Files Were Skipped",
+                                f"The backup was written, but {len(skipped)} file(s) "
+                                "could not be added:\n\n"
+                                + "\n".join(f"  {p}" for p in skipped[:12])
+                                + ("\n  ..." if len(skipped) > 12 else ""))
                         self.status_var.set(
                             f"Backed up {info.level_name}: {len(paths)} archive"
-                            f"{'s' if len(paths) != 1 else ''} ({names})")
+                            f"{'s' if len(paths) != 1 else ''} ({names}){note}")
                 elif kind == "restore_progress":
                     n, name = payload
                     progress = getattr(self, "_restore_progress", None)
@@ -539,7 +550,7 @@ class App(tk.Tk):
         info = self.tree_index.get(iid)
         if not info:
             return
-        browse_dir = backup_folder_for_browsing(info)
+        can_browse = has_any_backup_folder(info)
         has_world = get_world_dir(info).is_dir()
         world_state = "normal" if has_world else "disabled"
         menu = tk.Menu(self, tearoff=0)
@@ -571,7 +582,7 @@ class App(tk.Tk):
         menu.add_command(
             label="Browse Backups...",
             command=lambda: self._open_backups_folder(info),
-            state="normal" if browse_dir is not None else "disabled",
+            state="normal" if can_browse else "disabled",
         )
 
         menu.add_separator()
@@ -660,15 +671,16 @@ class App(tk.Tk):
 
         def worker():
             try:
+                skipped = []
                 paths = create_world_backup(
                     info, progress_cb=lambda n, name: self.task_queue.put(
                         ("backup_progress", (info, n, name))),
-                    cancel_event=cancel_event)
-                self.task_queue.put(("backup_done", (info, paths, None)))
+                    cancel_event=cancel_event, skipped_out=skipped)
+                self.task_queue.put(("backup_done", (info, paths, None, skipped)))
             except ExportCancelled:
-                self.task_queue.put(("backup_done", (info, None, None)))
+                self.task_queue.put(("backup_done", (info, None, None, [])))
             except Exception as e:
-                self.task_queue.put(("backup_done", (info, None, e)))
+                self.task_queue.put(("backup_done", (info, None, e, [])))
 
         self._backup_progress = progress
         threading.Thread(target=worker, daemon=True).start()
@@ -1781,7 +1793,7 @@ class App(tk.Tk):
         menu.add_command(
             label="Roll Back...",
             command=lambda: self._open_rollback_dialog(info, p),
-            state="normal" if browse_dir is not None else "disabled",
+            state="normal" if can_browse else "disabled",
         )
         menu.add_separator()
         if p.is_whitelisted:

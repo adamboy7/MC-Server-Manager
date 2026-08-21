@@ -701,6 +701,20 @@ def resolve_member_target(world_name: str, info: "ServerInfo",
     return None
 
 
+def has_any_backup_folder(info: "ServerInfo") -> bool:
+    """Whether Browse Backups... has anywhere to go.
+
+    Separate from backup_folder_for_browsing because this runs on every
+    right-click and only needs a yes/no: it stops at the first archive it
+    sees, where working out *which* folder holds the newest one has to stat
+    every archive. On a server with a few years of daily Aroma backups that
+    is the difference between a handful of stats and a couple of thousand."""
+    for folder in backup_search_dirs(info):
+        for _fp in _iter_backup_archive_files(folder):
+            return True
+    return bool(backup_search_dirs(info))
+
+
 def backup_folder_for_browsing(info: "ServerInfo") -> Optional[Path]:
     """The folder "Browse Backups..." should open, or None if this server has
     nowhere to look.
@@ -979,7 +993,8 @@ def _archive_world_folder(src: Path, dest_part: Path, arc_prefix: str,
 
 def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
                         progress_cb=None, cancel_event=None,
-                        purpose: str = "manual") -> list:
+                        purpose: str = "manual",
+                        skipped_out: Optional[list] = None) -> list:
     """Back this server's world up, following the local convention. Returns
     the archive paths written, newest-set-first order irrelevant.
 
@@ -1040,10 +1055,8 @@ def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
         os.replace(part, final)
 
     _write_backup_sidecar(info, convention, target, finals, dt)
-    if skipped:
-        create_world_backup.last_skipped = skipped
-    else:
-        create_world_backup.last_skipped = []
+    if skipped_out is not None:
+        skipped_out.extend(skipped)
     return finals
 
 
@@ -1174,6 +1187,10 @@ def restore_backup_set(info: "ServerInfo", bset: "BackupSet", scope: str = "all"
             if archive is None:
                 raise OSError(f"{member.path.name} is not a readable archive")
             with archive:
+                problem = archive.incremental_reason()
+                if problem is not None:
+                    raise ValueError(
+                        f"{member.path.name} cannot be restored: {problem}")
                 tmp = dest.parent / f"{dest.name}.restore-tmp"
                 if tmp.exists():
                     shutil.rmtree(tmp, ignore_errors=True)

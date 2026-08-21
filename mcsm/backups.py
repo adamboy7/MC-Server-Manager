@@ -701,6 +701,53 @@ def resolve_member_target(world_name: str, info: "ServerInfo",
     return None
 
 
+def backup_folder_for_browsing(info: "ServerInfo") -> Optional[Path]:
+    """The folder "Browse Backups..." should open, or None if this server has
+    nowhere to look.
+
+    Not simply `backups/`: SimpleBackups writes to `simplebackups/`, Aroma to
+    `backups/{level}/` (and 0.x a further `{Y}/{M}/{D}` down), and AutoBackup's
+    path is configurable. So this returns the directory actually holding the
+    most recent archive -- which is what someone means by "my backups" --
+    falling back to the first search directory that exists when there are no
+    archives yet."""
+    newest_time = None
+    newest_dir = None
+    for folder in backup_search_dirs(info):
+        for fp in _iter_backup_archive_files(folder):
+            try:
+                mtime = fp.stat().st_mtime
+            except OSError:
+                continue
+            if newest_time is None or mtime > newest_time:
+                newest_time, newest_dir = mtime, fp.parent
+    if newest_dir is not None:
+        return newest_dir
+    dirs = backup_search_dirs(info)
+    return dirs[0] if dirs else None
+
+
+def backup_storage_dirs(info: "ServerInfo") -> list:
+    """Non-overlapping folders holding this server's backups, for measuring
+    disk use.
+
+    backup_search_dirs deliberately lists nested paths (`backups/{level}/`
+    *and* `backups/`) because either may hold archives. Summing both would
+    count the same bytes twice, so this drops any directory that lives inside
+    another one in the list."""
+    dirs = []
+    for folder in backup_search_dirs(info):
+        try:
+            resolved = folder.resolve()
+        except OSError:
+            resolved = folder
+        if any(resolved == kept or kept in resolved.parents for kept in dirs):
+            continue
+        dirs = [d for d in dirs if resolved not in d.parents]
+        dirs.append(resolved)
+    return dirs
+
+
 @dataclass
 class BackupMember:
     path: Path

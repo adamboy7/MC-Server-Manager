@@ -59,12 +59,13 @@ except ImportError:
 
 
 from mcsm.backups import (
+    backup_folder_for_browsing,
+    backup_storage_dirs,
+    backup_search_dirs,
     RestoreRevertError,
     backup_search_dirs,
     create_world_backup,
     detect_backup_providers,
-    get_backups_dir,
-    get_world_backups_dir,
     list_world_backups,
     open_backup_archive,
     resolve_backup_convention,
@@ -538,7 +539,7 @@ class App(tk.Tk):
         info = self.tree_index.get(iid)
         if not info:
             return
-        has_backups = get_backups_dir(info).is_dir()
+        browse_dir = backup_folder_for_browsing(info)
         has_world = get_world_dir(info).is_dir()
         world_state = "normal" if has_world else "disabled"
         menu = tk.Menu(self, tearoff=0)
@@ -570,7 +571,7 @@ class App(tk.Tk):
         menu.add_command(
             label="Browse Backups...",
             command=lambda: self._open_backups_folder(info),
-            state="normal" if has_backups else "disabled",
+            state="normal" if browse_dir is not None else "disabled",
         )
 
         menu.add_separator()
@@ -596,11 +597,15 @@ class App(tk.Tk):
         self.status_var.set(f"Copied seed for {info.name}")
 
     def _open_backups_folder(self, info: ServerInfo):
-        backups_dir = get_backups_dir(info)
-        if not backups_dir.is_dir():
-            messagebox.showwarning("Folder Not Found", f"{backups_dir} no longer exists.")
+        target_dir = backup_folder_for_browsing(info)
+        if target_dir is None or not target_dir.is_dir():
+            messagebox.showwarning(
+                "No Backups Folder",
+                f"Couldn't find a backups folder for {info.name}.\n\n"
+                "Searched:\n"
+                + ("\n".join(f"  {d}" for d in backup_search_dirs(info))
+                   or "  (nowhere -- no backup tool was detected)"))
             return
-        target_dir = get_world_backups_dir(info)
         try:
             subprocess.run(["explorer", str(target_dir)])
         except OSError as e:
@@ -1554,8 +1559,8 @@ class App(tk.Tk):
         self.path_label.config(text=str(info.path))
 
         world_dir = get_world_dir(info)
-        backups_dir = get_backups_dir(info)
-        has_backups = backups_dir.is_dir()  # cheap stat, fine synchronously
+        backups_dirs = backup_storage_dirs(info)
+        has_backups = bool(backups_dirs)
 
         if info.sizes_computed:
             # Already scanned this ServerInfo instance -- reuse the cached
@@ -1586,7 +1591,7 @@ class App(tk.Tk):
             # world may not (e.g. a "No level.dat" server).
             threading.Thread(
                 target=self._compute_sizes,
-                args=(info, world_dir if world_dir.is_dir() else None, backups_dir if has_backups else None),
+                args=(info, world_dir if world_dir.is_dir() else None, backups_dirs),
                 daemon=True,
             ).start()
 
@@ -1625,7 +1630,7 @@ class App(tk.Tk):
     def _update_size_label(self):
         self.world_size_label.config(text=f"World: {self._pending_world_size} | Total: {self._pending_total_size}")
 
-    def _compute_sizes(self, info: ServerInfo, world_dir: Optional[Path], backups_dir: Optional[Path]):
+    def _compute_sizes(self, info: ServerInfo, world_dir: Optional[Path], backups_dirs: list):
         """Background thread: sums folder sizes and posts results back through
         the task queue, tagged with `info` so a stale result (user already
         selected a different server) can be dropped in _poll_queue. Posted as
@@ -1643,8 +1648,8 @@ class App(tk.Tk):
             info.world_size_bytes = None
         info.total_size_bytes = compute_folder_size(info.path)
         self.task_queue.put(("total_size_ready", (info, info.total_size_bytes)))
-        if backups_dir is not None:
-            info.backup_size_bytes = compute_folder_size(backups_dir)
+        if backups_dirs:
+            info.backup_size_bytes = sum(compute_folder_size(d) for d in backups_dirs)
             self.task_queue.put(("backup_size_ready", (info, info.backup_size_bytes)))
         else:
             info.backup_size_bytes = None
@@ -1776,7 +1781,7 @@ class App(tk.Tk):
         menu.add_command(
             label="Roll Back...",
             command=lambda: self._open_rollback_dialog(info, p),
-            state="normal" if has_backups else "disabled",
+            state="normal" if browse_dir is not None else "disabled",
         )
         menu.add_separator()
         if p.is_whitelisted:

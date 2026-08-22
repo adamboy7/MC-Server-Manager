@@ -1,7 +1,7 @@
 # Minecraft Server Setup (PoC)
 
-Vanilla, CraftBukkit, Spigot, Paper, Fabric, Forge, NeoForge, SpongeVanilla,
-SpongeForge, SpongeNeo and Decompiled. Pick a version, pick a folder, get a
+Vanilla, CraftBukkit, Spigot, Paper, Purpur, Folia, Fabric, Quilt, Forge,
+NeoForge, SpongeVanilla, SpongeForge, SpongeNeo and Decompiled. Pick a version, pick a folder, get a
 runnable server -- or, with Decompiled, an editable source workspace.
 
     python gui.py
@@ -12,7 +12,10 @@ Provider list is standalone too:
     python -m mcserver.providers.spigot
     python -m mcserver.providers.spigot --craftbukkit
     python -m mcserver.providers.paper
+    python -m mcserver.providers.purpur
+    python -m mcserver.providers.folia
     python -m mcserver.providers.fabric
+    python -m mcserver.providers.quilt
     python -m mcserver.providers.forge
     python -m mcserver.providers.neoforge
     python -m mcserver.providers.sponge
@@ -25,7 +28,10 @@ Provider list is standalone too:
     mcserver/providers/vanilla.py  Mojang piston-meta implementation
     mcserver/providers/spigot.py   BuildTools compile: Spigot / CraftBukkit
     mcserver/providers/paper.py    papermc.io Fill v3 API implementation
+    mcserver/providers/purpur.py   api.purpurmc.org v2 implementation
+    mcserver/providers/folia.py    Folia, subclassing Paper's Fill v3 machinery
     mcserver/providers/fabric.py   meta.fabricmc.net v2 implementation
+    mcserver/providers/quilt.py    meta.quiltmc.org v3 + quilt-installer
     mcserver/providers/forge.py    Forge maven + installer implementation
     mcserver/providers/neoforge.py NeoForge, subclassing Forge's installer machinery
     mcserver/providers/sponge.py   SpongeVanilla / SpongeForge / SpongeNeo
@@ -68,7 +74,8 @@ one Minecraft version into dropdown entries for every provider:
 `Version.build` carries the exact build when the provider could resolve it while
 listing. Forge and NeoForge can -- their whole build index is one document -- so
 they know which entries to emit and collapse the pair when both point at the
-same build. Fabric, Paper and Sponge need a request per Minecraft version, so
+same build. Fabric, Quilt, Paper, Purpur, Folia and Sponge need a request per
+Minecraft version, so
 they pass `resolved=False`, offer both entries, and resolve at install time;
 choosing `Recommended` where none exists gets a pointed error naming the
 `Latest` entry rather than a silent substitution. Either way the install notes
@@ -107,6 +114,163 @@ Paper doesn't reliably expose its own required Java version, so
 `required_java()` looks up the same Minecraft version in Mojang's manifest
 via `VanillaProvider` and reuses that. This is best-effort and silently
 skipped if it fails for any reason.
+
+## Quilt notes
+
+Quilt is a Fabric fork with a recognisably Fabric-shaped meta API, which makes
+the differences easy to miss and expensive to get wrong. `quilt.py` is **not**
+`fabric.py` with a different base URL — it installs like Forge. Four reasons:
+
+**1. There is no `/server/jar`.** Fabric hands you a prebuilt launcher jar at
+`/versions/loader/{game}/{loader}/{installer}/server/jar`, and that endpoint is
+the entire reason `fabric.py` can be a plain download. Quilt has no equivalent:
+its meta serves `/server/json` (launch metadata — `launcherMainClass` plus 14
+maven coordinates) and expects `quilt-installer` to turn that into a runnable
+directory. So this provider runs an installer, reports `STAGE_BUILD`, and needs
+a JVM on the machine.
+
+**2. Loader builds carry no `stable` flag.** Fabric's loader entries have
+`"stable": true|false`; Quilt's don't have the field at all — stability lives
+in the version string, as `0.30.1-beta.3`. So the split tests for a `-beta`
+marker, the way `neoforge.py` does. Reading Fabric's missing flag as falsy
+would have quietly marked *every* Quilt loader unstable and made `Recommended`
+permanently unreachable. There's a regression test for exactly that.
+
+**3. `launcherMeta` has no `min_java_version`.** That field is the one
+machine-readable Java hint `fabric.py` gets for free. Java here comes from
+Mojang via `VanillaProvider`, same best-effort lookup as Paper and Purpur.
+
+**4. The installer jar is checksummed — a step up.**
+`/v3/versions/installer` publishes `url`, `file_size` and sha1/sha256/sha512.
+Fabric publishes no checksum for its launcher jar at all. Here the one
+executable fetched is verified against a published SHA-256 *before it is run*,
+which matters more than for a server jar, because this one is handed to a JVM.
+
+### Two things that are inference, and how they degrade
+
+The documented command is exactly
+`java -jar quilt-installer-<ver>.jar install server <MC_VERSION> --download-server`.
+Two details around it aren't documented, so both fail safely:
+
+- **Pinning a loader.** Quilt's docs show only the Minecraft version, but the
+  Recommended/Latest split is meaningless without requesting a specific loader.
+  The resolved loader goes in as an optional positional
+  (`install server <mc> <loader>`), mirroring fabric-installer. On a non-zero
+  exit `_run_installer` retries **once** without it and adds a note saying the
+  pin wasn't honoured. A wrong guess costs one extra run, not a failed install.
+- **Where files land.** The docs say the install "generates a Minecraft server
+  installation in the `server/` directory", and `--install-dir` isn't
+  documented. So the installer runs with `cwd=dest_dir` and
+  `_flatten_server_dir` looks for the launch jar in `dest_dir` *or*
+  `dest_dir/server/`, hoisting the latter up a level. Correct either way. If
+  the jar is in neither place the install errors instead of reporting success.
+
+⚠️ **Neither path has been executed.** Both were written against the published
+docs and the installer's source, with no way to run a JVM against the live API
+from where this was written. The offline suite covers the index, the
+beta-from-string split, checksum rejection, the pinned/retry/flatten branches
+and the prerequisite gate — but not a real install. Run
+`python -m mcserver.providers.quilt` (lists and resolves, installs nothing),
+then one real install, before relying on it.
+
+### Known upstream bug
+
+quilt-installer issue #20: the generated `quilt-server-launch.jar` embeds
+library paths using the host's path separator, so a directory installed on
+Windows may not start on Linux. Not fixed upstream as far as could be
+determined, and not fixable here without rewriting the jar the installer just
+built — so the install notes say it, because "install on my desktop, upload to
+the VPS" is exactly what people do with this tool.
+
+## Folia notes
+
+Folia is PaperMC's own fork and ships through the same Fill v3 API under a
+different project id, so `folia.py` is project identity and nothing else --
+`project`, `cache_file` and a block of install notes. Everything else is
+`PaperProvider`'s, the way `neoforge.py` inherits Forge's installer machinery.
+
+Making that possible is the only change to `paper.py`: what used to be the
+module constants `PROJECT` / `DOWNLOAD_KEY` and a fixed `paper_versions.json`
+cache are now the class attributes `project` / `download_key` / `cache_file`,
+`_download_info` became a classmethod so it names the subclass in its errors,
+the hardcoded `"Paper"` in user-facing strings became `self.name`, the
+`plugins/` mkdir became `self.content_dir`, and `install_notes` is a class-level
+tuple appended to every successful install. Paper's own behaviour is unchanged.
+
+**Folia is not a drop-in Paper, and the install notes say so**, because
+someone picking it out of a dropdown expecting a faster Paper will otherwise
+find out the hard way:
+
+- **Plugins do not carry over.** Upstream: *"only plugins that have been
+  explicitly marked by the author(s) to work with Folia will be loaded. By
+  placing `folia-supported: true` into the plugin's plugin.yml, plugin authors
+  can mark their plugin as compatible with regionised multithreading."* A
+  `plugins/` folder copied from a Paper server silently loads almost nothing.
+  `content_dir` is still `plugins` — that *is* where they go — but the note
+  says what will happen to them.
+- **It wants real hardware and real players.** Upstream recommends *"at least
+  16 cores (not threads)"* and a server type that spreads players out
+  (skyblock, SMP) with a sizeable player count. On a 4-core box with six
+  players Folia is a downgrade.
+
+Folia's builds sit on Fill's ALPHA/BETA channels rather than STABLE, which
+Paper's existing channel logic already handles correctly: with the checkbox off
+it falls back to the newest build of any channel and names that channel in the
+notes, and choosing `Recommended` explicitly gets the pointed error naming the
+`Latest` entry. That error is worth keeping here rather than smoothing away —
+on Folia it is telling you something true about how finished the build is.
+
+The start scripts are inherited unchanged at `-Xms1G -Xmx2G`. That is the wrong
+number for a 16-core Folia box, but it is equally wrong for a busy Paper
+server, and guessing a bigger one would just be a different wrong number — so a
+note points at it instead.
+
+## Purpur notes
+
+Purpur is a fork of Paper, so the install is the same shape as Paper's --
+prebuilt jar, download and verify, nothing compiled. Its API
+(`api.purpurmc.org/v2`) is smaller than Fill: `/v2/purpur` lists the Minecraft
+versions, `/v2/purpur/{version}` gives `builds.latest` plus a `builds.all`
+array, `/v2/purpur/{version}/{build}` gives that build's metadata, and
+`/v2/purpur/{version}/{build}/download` is the jar.
+
+Two things differ from Paper and both are handled in `purpur.py`:
+
+**No promotion channel.** Paper tags builds STABLE/BETA/ALPHA; Purpur tags
+nothing. What it does have is builds that failed to compile, still listed and
+still numbered. So the Recommended/Latest split (see "Version channels")
+resolves against the build's `result` field instead: Recommended is the newest
+build that actually compiled, Latest is the newest build full stop. Usually
+they're the same and the distinction costs nothing. When the newest build is a
+FAILURE, Recommended walks back up to `MAX_BUILD_PROBES` (12) builds to the
+last good one and names it in the install notes; Latest raises a pointed error
+naming the Recommended entry rather than fetching a jar that doesn't exist.
+Each probe is one request, hence the bound -- a run of failures that long is an
+upstream problem, not a build that's merely fresh.
+
+**MD5, not SHA-256.** That's what the API publishes, so that's what's verified.
+It catches a truncated or corrupted download, which is the failure actually
+being guarded against; it is not a meaningful defence against a tampered jar,
+and the install notes say exactly that instead of implying a stronger guarantee
+than the upstream data supports.
+
+One ordering trap worth knowing about: `/v2/purpur` returns `versions`
+**oldest-first**, the opposite of Fill and the opposite of what the dropdown
+wants. A bare `reverse()` would work today and fail silently the day upstream
+flips it, since both ends of the list are real version numbers either way, so
+`_newest_first()` measures the direction -- it compares the first and last ids
+that parse as numbers and reverses only if the list is genuinely ascending.
+That numeric key is used for nothing else; ordering the list by it would break
+the moment an id isn't dotted numbers.
+
+Like Paper, Purpur doesn't publish its required Java version, so
+`required_java()` looks the same Minecraft version up through
+`VanillaProvider`. Best-effort and silently skipped on any failure.
+
+The version list is cached for 6h in
+`%LOCALAPPDATA%/mc-server-manager/purpur_versions.json`; builds are always
+fetched fresh, and a stale cache is used as a fallback if the API is
+unreachable.
 
 ## Spigot / CraftBukkit notes
 

@@ -27,6 +27,16 @@ module could confirm, so `required_java()` piggybacks on VanillaProvider's
 per-version metadata instead (Paper runs on the same JVM as the vanilla
 version it's built from). That lookup is best-effort: if it fails for any
 reason, the install proceeds without a Java note.
+
+## Subclassing
+
+Fill serves several projects through one shape, so everything that names
+"paper" specifically is a class attribute rather than a module constant:
+`project`, `cache_file`, `download_key`, plus `name` / `content_dir` from the
+Provider protocol and an `install_notes` hook for anything a fork needs to
+say at the end of an install. `folia.py` is the whole of that mechanism's
+current use -- same API, same install, different project id and a very
+different set of warnings -- following neoforge.py subclassing forge.py.
 """
 
 from __future__ import annotations
@@ -41,7 +51,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from typing import Optional
+from typing import Optional, Sequence
 
 from .base import (
     CHANNEL_LATEST,
@@ -72,17 +82,24 @@ _STABLE_CHANNELS = {"STABLE", "RECOMMENDED"}
 CACHE_TTL = 60 * 60 * 6  # 6h -- the *list* of MC versions rarely changes; builds are always fetched fresh
 
 
-def _cache_path() -> str:
+def _cache_path(filename: str) -> str:
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
     d = os.path.join(base, "mc-server-manager")
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "paper_versions.json")
+    return os.path.join(d, filename)
 
 
 class PaperProvider:
     name = "Paper"
     content_dir = "plugins"
     compiles_from_source = False
+
+    # ---- Fill project identity. Overridden by forks; see the module header.
+    project = PROJECT
+    cache_file = "paper_versions.json"
+    download_key = DOWNLOAD_KEY
+    #: Appended verbatim to every successful install's notes.
+    install_notes: Sequence[str] = ()
 
     def __init__(self) -> None:
         self._project: Optional[dict] = None
@@ -94,7 +111,7 @@ class PaperProvider:
         if self._project is not None:
             return self._project
 
-        cache = _cache_path()
+        cache = _cache_path(self.cache_file)
         if os.path.exists(cache) and time.time() - os.path.getmtime(cache) < CACHE_TTL:
             try:
                 with open(cache, "r", encoding="utf-8") as fh:
@@ -104,9 +121,9 @@ class PaperProvider:
                 pass  # corrupt cache -> refetch
 
         if progress:
-            progress(STAGE_INDEX, 0, None, "Fetching Paper version list...")
+            progress(STAGE_INDEX, 0, None, f"Fetching {self.name} version list...")
         try:
-            raw = fetch(f"{BASE_URL}/projects/{PROJECT}")
+            raw = fetch(f"{BASE_URL}/projects/{self.project}")
             data = json.loads(raw)
         except ProviderError:
             if os.path.exists(cache):
@@ -174,14 +191,16 @@ class PaperProvider:
         if version_id in self._builds_cache:
             return self._builds_cache[version_id]
         if progress:
-            progress(STAGE_RESOLVE, 0, None, f"Fetching Paper builds for {version_id}...")
-        url = f"{BASE_URL}/projects/{PROJECT}/versions/{version_id}/builds"
+            progress(STAGE_RESOLVE, 0, None, f"Fetching {self.name} builds for {version_id}...")
+        url = f"{BASE_URL}/projects/{self.project}/versions/{version_id}/builds"
         data = json.loads(fetch(url))
         # Fill returns a bare array; tolerate a {"builds": [...]} wrapper too
         # in case that changes.
         builds = data if isinstance(data, list) else data.get("builds", [])
         if not builds:
-            raise ProviderError(f"No Paper builds published for Minecraft {version_id}.")
+            raise ProviderError(
+                f"No {self.name} builds published for Minecraft {version_id}."
+            )
         self._builds_cache[version_id] = builds
         return builds
 
@@ -208,20 +227,21 @@ class PaperProvider:
             return newest(stable)
         if channel == CHANNEL_RECOMMENDED:
             raise ProviderError(
-                f"Paper {version_id} has no stable build yet -- every build so far "
+                f"{self.name} {version_id} has no stable build yet -- every build so far "
                 'is a beta or alpha. Pick the "Latest" entry for this version '
                 "instead."
             )
         return newest(builds)
 
-    @staticmethod
-    def _download_info(build: dict) -> tuple[str, str, Optional[str]]:
+    @classmethod
+    def _download_info(cls, build: dict) -> tuple[str, str, Optional[str]]:
         """-> (url, filename, sha256_or_None). Tolerant of minor schema drift."""
         downloads = build.get("downloads") or {}
-        entry = downloads.get(DOWNLOAD_KEY) or downloads.get("application")
+        entry = downloads.get(cls.download_key) or downloads.get("application")
         if not entry or not entry.get("url"):
             raise ProviderError(
-                f"Paper build {build.get('id', '?')} has no '{DOWNLOAD_KEY}' download."
+                f"{cls.name} build {build.get('id', '?')} has no "
+                f"'{cls.download_key}' download."
             )
         url = entry["url"]
         name = entry.get("name") or posixpath.basename(urllib.parse.urlsplit(url).path) or "server.jar"
@@ -259,7 +279,7 @@ class PaperProvider:
             if progress:
                 progress(stage, done, total, msg)
 
-        report(STAGE_RESOLVE, 0, None, f"Resolving Paper {version.id}...")
+        report(STAGE_RESOLVE, 0, None, f"Resolving {self.name} {version.id}...")
         build = self._select_build(version.id, progress, version.channel)
         build_id = build.get("id") or build.get("build")
         download_url, jar_name, expected_sha256 = self._download_info(build)
@@ -290,7 +310,7 @@ class PaperProvider:
 
             report(STAGE_VERIFY, 0, None, "Verifying checksum...")
             notes: list[str] = [
-                f"Paper build {build_id} ({build.get('channel', 'unknown').lower()})."
+                f"{self.name} build {build_id} ({build.get('channel', 'unknown').lower()})."
             ]
             if expected_sha256:
                 if digest.hexdigest() != expected_sha256:
@@ -312,7 +332,8 @@ class PaperProvider:
 
         report(STAGE_FINALIZE, 0, None, "Writing server files...")
 
-        os.makedirs(os.path.join(dest_dir, "plugins"), exist_ok=True)
+        if self.content_dir:
+            os.makedirs(os.path.join(dest_dir, self.content_dir), exist_ok=True)
 
         eula_path = os.path.join(dest_dir, "eula.txt")
         if accept_eula:
@@ -336,6 +357,7 @@ class PaperProvider:
 
         if java_major:
             notes.append(f"This version requires Java {java_major}.")
+        notes.extend(self.install_notes)
 
         return InstallResult(
             server_dir=dest_dir,

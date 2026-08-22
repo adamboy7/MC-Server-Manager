@@ -17,10 +17,10 @@ cross-check in the test suite is there to catch.
 #
 # Fetch installs; this package inspects. Keeping one spelling between them is
 # what makes "this folder is Paper 26.1.2" and "install the latest Paper"
-# talk about the same thing. The four we detect but cannot install yet
-# (Purpur, Folia, Pufferfish, Leaf, Quilt) are listed here deliberately --
-# detection running ahead of installation is fine, the reverse is a bug, and
-# test_loaders_match_fetch() checks that direction.
+# talk about the same thing. The two we detect but cannot install yet
+# (Pufferfish, Leaf) are listed here deliberately -- detection running ahead
+# of installation is fine, the reverse is a bug, and test_loaders_match_fetch()
+# checks that direction.
 # ---------------------------------------------------------------------------
 
 LOADER_FAMILIES = {

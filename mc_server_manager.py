@@ -64,7 +64,6 @@ from mcsm.backups import (
     backup_storage_dirs,
     backup_search_dirs,
     RestoreRevertError,
-    backup_search_dirs,
     create_world_backup,
     detect_backup_providers,
     list_world_backups,
@@ -1793,7 +1792,7 @@ class App(tk.Tk):
         menu.add_command(
             label="Roll Back...",
             command=lambda: self._open_rollback_dialog(info, p),
-            state="normal" if can_browse else "disabled",
+            state="normal" if has_backups else "disabled",
         )
         menu.add_separator()
         if p.is_whitelisted:

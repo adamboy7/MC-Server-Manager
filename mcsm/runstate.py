@@ -198,15 +198,28 @@ def _classify_lock_error(exc: OSError, path: Path):
 
 
 def probe_file_lock(path: Path):
-    """(result, detail) where result is "locked", "free" or "unknown".
+    """(result, detail) where result is "locked", "absent", "free" or
+    "unknown".
 
     "locked" means another process holds this file -- trustworthy wherever it
-    comes from, since nothing else produces it. "free" means we took the lock
-    ourselves, which only rules anything out on local storage; the caller is
-    responsible for that check."""
+    comes from, since nothing else produces it.
+
+    "absent" is the *strongest* negative answer, stronger than "free". A
+    server creates session.lock when it opens a world (DirectoryLock.create
+    uses StandardOpenOption.CREATE) and never deletes it -- close() releases
+    the lock and closes the channel, nothing more. So a world with no
+    session.lock has never been opened by anything, and unlike a lock we
+    merely acquired, that conclusion survives network storage: a server on
+    another machine would have *created* the file, and file existence
+    propagates over SMB and NFS even where lock semantics do not. Mojang
+    reads it the same way -- DirectoryLock.isLocked catches
+    NoSuchFileException and returns false.
+
+    "free" means we took the lock ourselves, which only rules anything out on
+    local storage; the caller is responsible for that check."""
     path = Path(path)
     if not path.is_file():
-        return "unknown", f"{path.name} is not present"
+        return "absent", f"{path.name} does not exist -- world never opened"
     try:
         handle = open(path, "r+b")
     except OSError as e:
@@ -242,15 +255,25 @@ def probe_file_lock(path: Path):
         handle.close()
 
 
-def world_lock_paths(info: "ServerInfo") -> list:
-    """Every session.lock this server's world spans. A split (Bukkit) world
-    has one per dimension folder and the server locks all of them, so
-    checking only the overworld would sail straight past a locked nether."""
+def expected_lock_paths(info: "ServerInfo") -> list:
+    """Every session.lock this server's world *would* span, whether or not it
+    exists yet. A split (Bukkit) world has one per dimension folder and the
+    server locks all of them, so checking only the overworld would sail
+    straight past a locked nether.
+
+    Unfiltered on purpose: an absent session.lock is a verdict, not a gap
+    (see probe_file_lock), and filtering it out here is what used to throw
+    that answer away."""
     paths = [get_world_dir(info) / "session.lock"]
     if has_satellite_dimension_folders(info):
         paths.append(get_nether_dir(info) / "session.lock")
         paths.append(get_the_end_dir(info) / "session.lock")
-    return [p for p in paths if p.is_file()]
+    return paths
+
+
+def world_lock_paths(info: "ServerInfo") -> list:
+    """The subset of expected_lock_paths that is actually on disk."""
+    return [p for p in expected_lock_paths(info) if p.is_file()]
 
 
 def read_log_tail(path: Path, limit: int = LOG_TAIL_BYTES) -> str:
@@ -300,24 +323,48 @@ def log_shows_clean_stop(info: "ServerInfo"):
 def check_server_running(info: "ServerInfo") -> RunState:
     """Best available answer, with the reasoning attached.
 
-    A refused lock is taken as proof anywhere. An acquired lock only clears
-    the server on local storage; everywhere else we fall through to the log,
-    and if that cannot confirm a shutdown either we say so rather than
-    guessing."""
-    locks = world_lock_paths(info)
+    Four rungs, and only the last is inference:
+
+      no session.lock at all   -> stopped, anywhere. Nothing has ever opened
+                                  this world, and that survives a network
+                                  share because file existence propagates
+                                  even where lock semantics do not.
+      lock refused             -> running, anywhere. Proof.
+      lock acquired + local    -> stopped. Proof, on storage that can carry a
+                                  lock; the log is read for the detail trail
+                                  but does not change the verdict.
+      anything else            -> the log. A clean shutdown reads as stopped
+                                  with the caveat stated; otherwise unknown.
+    """
+    locks = expected_lock_paths(info)
     detail = []
-    acquired_all = bool(locks)
+    results = []
     for lock_path in locks:
         result, why = probe_file_lock(lock_path)
         detail.append(why)
         if result == "locked":
             return RunState("running",
                             "The world is locked by a running process.", detail)
-        if result != "free":
-            acquired_all = False
+        results.append(result)
+
+    # Nothing has ever opened this world -- the strongest negative available,
+    # and the only confident answer that does not need local storage. Reached
+    # by a freshly unzipped world, and by anything restored from an MCSM
+    # export, which strips session.lock (world.EXPORT_SKIP_FILES).
+    if results and all(r == "absent" for r in results):
+        return RunState(
+            "stopped",
+            "No session.lock exists, so no server has ever opened this world.",
+            detail)
 
     local, why_local = storage_is_local(get_world_dir(info))
     detail.append(f"storage: {why_local}")
+
+    # "absent" is at least as good as "free" here: a dimension folder with no
+    # lock file was never opened, which is exactly what "free" is trying to
+    # establish. A split world part-way through its first start can show one
+    # of each.
+    acquired_all = bool(results) and all(r in ("absent", "free") for r in results)
 
     if acquired_all and local:
         stopped, log_why = log_shows_clean_stop(info)
@@ -333,12 +380,12 @@ def check_server_running(info: "ServerInfo") -> RunState:
     if stopped:
         return RunState(
             "stopped",
-            "No lock was found and the log ends with a clean shutdown -- "
-            "but this world is not on local storage, so a lock held by a "
-            "server elsewhere would not be visible from here.",
+            "Nothing here holds this world and the log ends with a clean "
+            "shutdown -- but this world is not on local storage, so a lock "
+            "held by a server elsewhere would not be visible from here.",
             detail)
     return RunState(
         "unknown",
-        "Could not confirm whether a server has this world open: no lock was "
-        "found, and the log does not end with a clean shutdown.",
+        "Could not confirm whether a server has this world open: nothing "
+        "here holds it, and the log does not end with a clean shutdown.",
         detail)

@@ -29,6 +29,23 @@ def get_backups_dir(info: "ServerInfo") -> Path:
     return info.path / "backups"
 
 
+def get_mcsm_backups_dir(info: "ServerInfo") -> Path:
+    """The folder the backups *we* write live in, flat.
+
+    Deliberately a sibling of backups/ rather than a folder inside it. Every
+    provider we detect writes somewhere under the server root and backups/ is
+    the default output for two of them, so a folder no installed tool has a
+    configured path into is the only kind nothing else prunes, rotates or
+    diffs against. Created lazily, at write time -- see create_world_backup.
+
+    Flat, and everything in it is one kind. The copy taken automatically
+    before a rollback used to live apart from one the user asked for, back
+    when that separation was protection from another tool's retention. In a
+    folder nothing else touches it bought nothing but a second path."""
+    return info.path / "mcsm-backups"
+
+
+
 def get_world_backups_dir(info: "ServerInfo") -> Path:
     """The folder that actually holds this world's dated backup archives --
     prefer the world-specific subfolder if present, falling back to the
@@ -100,7 +117,9 @@ AROMA0_ARCHIVE_RE = re.compile(
 AROMA_MANIFEST_NAME = "incremental.aromabackup"
 
 BACKUP_PROVIDER_NAMES = {
-    "mcsm-safety": "Safety backup (ours)",
+    # Ours. Everything else in this table is the name of somebody else's tool,
+    # which is the point of the column -- a set says who made it.
+    "mcsm": "MCSM",
     "aroma3": "AromaBackup",
     "aroma0": "AromaBackup (legacy)",
     "autobackup": "AutoBackup",
@@ -111,7 +130,7 @@ BACKUP_PROVIDER_NAMES = {
 }
 
 # Providers whose archives we can read well enough to restore from.
-RESTORABLE_PROVIDERS = {"mcsm-safety", "aroma3", "aroma0", "autobackup",
+RESTORABLE_PROVIDERS = {"mcsm", "aroma3", "aroma0", "autobackup",
                         "simplebackups", "unknown"}
 
 
@@ -630,13 +649,13 @@ def backup_search_dirs(info: "ServerInfo") -> list:
         seen.add(key)
         dirs.append(d)
 
+    # Ours first -- the one folder whose contents we can actually vouch for,
+    # and a pre-rollback copy nobody can find is not worth taking.
+    add(get_mcsm_backups_dir(info))
     for provider in detect_backup_providers(info):
         for d in provider.search_dirs:
             add(d)
     backups = get_backups_dir(info)
-    # Ours. Listed first so a safety copy is always visible in the rollback
-    # dialog -- a safety backup nobody can find is not a safety backup.
-    add(backups / "mcsm-safety")
     add(backups / info.level_name)
     add(backups)
     simple = info.path / "simplebackups"
@@ -825,13 +844,19 @@ def list_world_backups(info: "ServerInfo") -> list:
                 provider_by_dir.setdefault(d.resolve(), provider.key)
             except OSError:
                 pass
+    ours_dir = get_mcsm_backups_dir(info)
+    try:
+        ours_dir = ours_dir.resolve()
+    except OSError:
+        pass
 
     sets = {}
     for folder in backup_search_dirs(info):
         try:
-            folder_provider = provider_by_dir.get(folder.resolve())
+            folder_key = folder.resolve()
         except OSError:
-            folder_provider = None
+            folder_key = folder
+        folder_provider = provider_by_dir.get(folder_key)
         for fp in _iter_backup_archive_files(folder):
             parsed = parse_backup_archive_name(fp.name)
             if parsed is None:
@@ -843,8 +868,10 @@ def list_world_backups(info: "ServerInfo") -> list:
                     dt = None
                 parsed = ParsedBackupName(fp.stem, dt, fp.name, "unknown")
             provider = parsed.provider
-            if folder.name == "mcsm-safety":
-                provider = "mcsm-safety"
+            if folder_key == ours_dir:
+                # Ours are identified by the folder, never by the filename:
+                # we share a dated grammar with AutoBackup and always will.
+                provider = "mcsm"
             elif provider == "autobackup" and folder_provider in ("simplebackups",):
                 # The two share a filename grammar; the folder disambiguates.
                 provider = folder_provider
@@ -872,116 +899,65 @@ def list_world_backups(info: "ServerInfo") -> list:
 # ---------------------------------------------------------------------------
 # Writing a backup
 #
-# Decision: mimic whatever convention the server's own backup tool uses, so
-# the archives we write sit alongside its own rather than in a parallel
-# folder nobody looks in. The costs of that are real and are spelled out for
-# the user in the confirm dialog:
+# Decision: everything we write goes to mcsm-backups/, a folder no other tool
+# has a configured path into, and appears in the rollback list because we list
+# it -- not because it looks like somebody else's.
 #
-#   * their retention applies to ours -- AutoBackup keeps 15, SimpleBackups
-#     10, Aroma 3.x 30 full backups -- so ours are eventually pruned;
-#   * we cannot tell ours from theirs afterwards, which is why nothing in
-#     this app ever offers to prune or bulk-delete backups;
-#   * on Aroma we inherit its sidecar contract (see below).
+# This app used to mimic the installed tool's folder and filename grammar so
+# our archives would sit alongside its own. That was reversed because the
+# archives were only ever read back by us, while the folder was shared with a
+# live process holding opinions we cannot enumerate:
+#
+#   * their retention counted ours -- AutoBackup keeps 15, SimpleBackups 10,
+#     Aroma 3.x 30 full backups -- so a backup could be pruned within hours
+#     of being taken;
+#   * a full archive of ours in backups/{level}/ counts toward Aroma's
+#     fullBackupsToKeep and is pattern-matched by its pruner, whatever we do
+#     or do not write beside it;
+#   * every mimicked grammar was a guess about a format we do not control,
+#     so a mod update could turn our archives into litter in its folder.
+#
+# Reading is unaffected: all six systems are still detected, listed and
+# restored from. We just no longer write into any of them.
 # ---------------------------------------------------------------------------
 
 @dataclass
 class BackupConvention:
     provider: str
     directory: Path
-    nested: bool           # world contents under "{folder}/" inside the archive
-    date_nested: bool      # archives filed under {Y}/{M}/{D}/
-    sidecar: Optional[str] # "backupinfo" | "backupstore" | None
-    kind: str = "zip"      # container format: zip | tar | tar.gz
-
-    @property
-    def suffix(self) -> str:
-        return {"tar": ".tar", "tar.gz": ".tar.gz"}.get(self.kind, ".zip")
 
     def archive_name(self, world_folder: str, dt: datetime) -> str:
-        if self.provider == "aroma3":
-            return (f"Backup--{world_folder}--{dt.strftime(AROMA3_DATE_FORMAT)}"
-                    f"{self.suffix}")
-        if self.provider == "aroma0":
-            # 0.x predates the compressionType option and is always a zip.
-            return (f"Backup-{world_folder}-{dt.year}-{dt.month}-{dt.day}"
-                    f"--{dt.hour:02d}-{dt.minute:02d}.zip")
+        """One archive per world folder, world contents at the archive root.
+
+        The grammar is AutoBackup's, which we are free to keep now that the
+        folder is what identifies ours: DATED_ARCHIVE_RE already parses it, so
+        listing needs no pattern of its own, and the stamp has the seconds
+        resolution that grouping a split world into one set depends on."""
         return f"{world_folder}_{dt.strftime('%Y-%m-%d_%H-%M-%S')}.zip"
 
-    def target_dir(self, level_name: str, dt: datetime) -> Path:
-        d = self.directory
-        if self.date_nested:
-            d = d / str(dt.year) / str(dt.month) / str(dt.day)
-        return d
+
+def resolve_backup_convention(info: "ServerInfo") -> BackupConvention:
+    """Where a backup goes and what it is called. One answer, by design."""
+    return BackupConvention("mcsm", get_mcsm_backups_dir(info))
 
 
-def resolve_backup_convention(info: "ServerInfo",
-                              purpose: str = "manual") -> BackupConvention:
-    """How to write a backup on this server, following whatever is already
-    installed. Falls back to the AutoBackup shape in backups/, which is the
-    most common and matches what get_world_backups_dir already reads.
-
-    purpose="safety" is the deliberate exception to the mimicry rule. A
-    pre-rollback safety copy written under the local convention counts
-    toward the installed tool's retention, and on a full folder that can
-    evict the very archive the user is restoring *from*. It is the one
-    backup whose entire purpose is to survive, so it goes somewhere we
-    control and nothing else prunes."""
-    if purpose == "safety":
-        return BackupConvention("mcsm-safety",
-                                get_backups_dir(info) / "mcsm-safety",
-                                False, False, None)
-    providers = {p.key: p for p in detect_backup_providers(info)}
-    for key in ("aroma3", "aroma0", "simplebackups", "autobackup"):
-        p = providers.get(key)
-        if p is None:
-            continue
-        base = p.search_dirs[0] if p.search_dirs else get_backups_dir(info)
-        if key == "aroma3":
-            # Aroma can be configured to emit tar or tar.gz instead of zip.
-            # Mimicry means matching that, or ours is the odd file out in a
-            # folder the mod is pruning by pattern.
-            kind = "zip"
-            if p.config_path is not None:
-                ctype = _read_forge_cfg(p.config_path).get("compressionType", "zip")
-                if ctype in ("tar", "tar.gz"):
-                    kind = ctype
-            return BackupConvention("aroma3", base / info.level_name, False, False,
-                                    "backupinfo", kind)
-        if key == "aroma0":
-            return BackupConvention("aroma0", base / info.level_name, True, True,
-                                    "backupstore")
-        if key == "simplebackups":
-            return BackupConvention("simplebackups", base, True, False, None)
-        return BackupConvention("autobackup", base, False, False, None)
-    return BackupConvention("autobackup", get_backups_dir(info), False, False, None)
-
-
-def _archive_world_folder(src: Path, dest_part: Path, arc_prefix: str,
-                          kind: str = "zip", progress_cb=None,
+def _archive_world_folder(src: Path, dest_part: Path, progress_cb=None,
                           cancel_event=None) -> tuple:
     """Archive one world folder to dest_part. Returns (files written, skipped).
 
-    Always writes forward slashes, even when mimicking AutoBackup: its
-    backslashes are out of spec, nothing reads ours by path except us, and
-    the retention we are blending in with is filename-based."""
+    Zip, world contents at the archive root, forward slashes. The reader still
+    handles tar, nesting and AutoBackup's out-of-spec backslashes because
+    other tools produce them; the writer has no reason to."""
     count = 0
     skipped = []
-    if kind == "zip":
-        container = zipfile.ZipFile(dest_part, "w", zipfile.ZIP_DEFLATED)
-        add = lambda src_file, arcname: container.write(src_file, arcname)
-    else:
-        container = tarfile.open(dest_part, "w:gz" if kind == "tar.gz" else "w")
-        add = lambda src_file, arcname: container.add(src_file, arcname,
-                                                      recursive=False)
-    with container:
+    with zipfile.ZipFile(dest_part, "w", zipfile.ZIP_DEFLATED) as container:
         for abs_path, rel_path in _iter_files(src):
             if cancel_event is not None and cancel_event.is_set():
                 raise ExportCancelled()
             if abs_path.name in EXPORT_SKIP_FILES:
                 continue
-            arcname = arc_prefix + rel_path.as_posix()
             try:
-                add(abs_path, arcname)
+                container.write(abs_path, rel_path.as_posix())
             except (OSError, ValueError):
                 skipped.append(rel_path.as_posix())
                 continue
@@ -993,18 +969,17 @@ def _archive_world_folder(src: Path, dest_part: Path, arc_prefix: str,
 
 def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
                         progress_cb=None, cancel_event=None,
-                        purpose: str = "manual",
                         skipped_out: Optional[list] = None) -> list:
-    """Back this server's world up, following the local convention. Returns
-    the archive paths written, newest-set-first order irrelevant.
+    """Back this server's world up into mcsm-backups/. Returns the archive
+    paths written, newest-set-first order irrelevant.
 
     On a split world this writes one archive per world folder, all from a
     single datetime so they group as one set, and all-or-nothing: every
     archive is staged as a .part and only renamed once the last one closes.
     A half-written set must never look like a backup."""
     dt = dt or datetime.now()
-    convention = resolve_backup_convention(info, purpose)
-    target = convention.target_dir(info.level_name, dt)
+    convention = resolve_backup_convention(info)
+    target = convention.directory
 
     folders = [(info.level_name, get_world_dir(info))]
     if has_satellite_dimension_folders(info):
@@ -1014,17 +989,14 @@ def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
     if not folders:
         raise OSError(f"No world folder found at {get_world_dir(info)}")
 
-    # Two backups in the same second would collide. The stamp has seconds
-    # resolution (Aroma's has minutes), so nudge the clock forward rather
-    # than inventing a suffix -- a suffix would break the filename grammar
-    # and orphan the set from its siblings.
-    step = 60 if convention.provider in ("aroma3", "aroma0") else 1
+    # Two backups in the same second would collide. Nudge the clock forward
+    # rather than inventing a suffix -- a suffix would break the filename
+    # grammar and orphan the set from its siblings.
     for _ in range(120):
-        target = convention.target_dir(info.level_name, dt)
         names = [convention.archive_name(n, dt) for n, _ in folders]
         if not any((target / n).exists() for n in names):
             break
-        dt = dt + timedelta(seconds=step)
+        dt = dt + timedelta(seconds=1)
     else:
         raise OSError(
             f"could not find a free backup name near {dt:%Y-%m-%d %H:%M:%S} "
@@ -1037,11 +1009,10 @@ def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
             name = convention.archive_name(world_folder, dt)
             final = target / name
             part = target / (name + ".part")
-            prefix = f"{world_folder}/" if convention.nested else ""
             parts.append(part)
             finals.append(final)
             _n, part_skipped = _archive_world_folder(
-                src, part, prefix, convention.kind, progress_cb, cancel_event)
+                src, part, progress_cb, cancel_event)
             skipped.extend(f"{world_folder}/{s}" for s in part_skipped)
     except BaseException:
         for part in parts:
@@ -1054,63 +1025,9 @@ def create_world_backup(info: "ServerInfo", dt: Optional[datetime] = None,
     for part, final in zip(parts, finals):
         os.replace(part, final)
 
-    _write_backup_sidecar(info, convention, target, finals, dt)
     if skipped_out is not None:
         skipped_out.extend(skipped)
     return finals
-
-
-def _write_backup_sidecar(info: "ServerInfo", convention: BackupConvention,
-                          target: Path, archives: list, dt: datetime) -> None:
-    """The metadata file the local convention expects beside an archive.
-
-    Mimicry reverses the "never write a sidecar" default on Aroma servers:
-    Aroma's own file says "Do not move, edit or delete this file. If you do,
-    backups may not be automatically restorable", and AromaBackupRecovery
-    reads it. An archive of ours dropped into an Aroma folder without one is
-    exactly the half-a-backup that warning describes. Everywhere else this
-    writes nothing.
-
-    Deliberately never writes incremental.aromabackup -- ours are always full
-    backups, and a manifest we generated would become the baseline Aroma
-    diffs its next incremental against: a chain rooted in a file we wrote and
-    do not maintain."""
-    try:
-        if convention.sidecar == "backupinfo":
-            body = (
-                "#=============================================\r\n"
-                "#This is an important file for your backups.\r\n"
-                "#Do not move, edit or delete this file.\r\n"
-                "#If you do, backups may not be automatically restorable.\r\n"
-                "#=============================================\r\n"
-                f"#{dt.strftime('%a %b %d %H:%M:%S %Z %Y').replace('  ', ' ')}\r\n"
-                f"date={int(dt.timestamp() * 1000)}\r\n"
-                f"world={info.level_name}\r\n"
-            )
-            for archive in archives:
-                # Not Path.with_suffix: it replaces only the final component,
-                # so "Backup--world--….tar.gz" would become "….tar.backupinfo".
-                sidecar_path = archive.with_name(
-                    strip_archive_suffix(archive.name) + ".backupinfo")
-                sidecar_path.write_bytes(body.encode("utf-8"))
-        elif convention.sidecar == "backupstore":
-            # Aroma 0.x keeps one shared index at the world's backup root
-            # (above the {Y}/{M}/{D} nesting), one line per world. Append
-            # rather than overwrite -- other worlds have lines in here.
-            store = convention.directory / "backupstore.txt"
-            line = (f"{info.level_name}={dt.year}={dt.month}={dt.day}"
-                    f"={dt.hour}={dt.minute}\r\n")
-            existing = ""
-            if store.is_file():
-                existing = store.read_text(encoding="utf-8", errors="replace")
-                kept = [l for l in existing.replace("\r", "").splitlines()
-                        if l.strip() and not l.startswith(f"{info.level_name}=")]
-                existing = "".join(l + "\r\n" for l in kept)
-            store.write_text(existing + line, encoding="utf-8", newline="")
-    except OSError:
-        # The archives are already in place and are the actual backup; a
-        # sidecar we couldn't write is worth neither failing nor rolling back.
-        pass
 
 
 # ---------------------------------------------------------------------------

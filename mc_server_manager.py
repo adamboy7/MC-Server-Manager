@@ -65,7 +65,6 @@ from mcsm.backups import (
     backup_search_dirs,
     RestoreRevertError,
     create_world_backup,
-    detect_backup_providers,
     list_world_backups,
     open_backup_archive,
     resolve_backup_convention,
@@ -624,15 +623,13 @@ class App(tk.Tk):
     # -- Creating a backup ----------------------------------------------------
 
     def _create_backup(self, info: ServerInfo):
-        """Back the world up now, following whatever convention the server's
-        own backup tool uses."""
+        """Back the world up now, into the folder we own."""
         world_dir = get_world_dir(info)
         if not world_dir.is_dir():
             messagebox.showwarning("World Not Found", f"{world_dir} no longer exists.")
             return
 
         convention = resolve_backup_convention(info)
-        providers = detect_backup_providers(info)
         folders = [info.level_name]
         if has_satellite_dimension_folders(info):
             folders += [f"{info.level_name}_nether", f"{info.level_name}_the_end"]
@@ -643,17 +640,13 @@ class App(tk.Tk):
             f"Back up {info.level_name} from {info.name}?",
             "",
             f"Archives:     {len(folders)} ({', '.join(folders)})",
-            f"Destination:  {convention.target_dir(info.level_name, datetime.now())}",
+            f"Destination:  {convention.directory}",
             f"World size:   {size_note}",
+            "",
+            "That folder is ours alone -- no other backup tool writes to it or "
+            "prunes it, so this archive stays until you delete it. It will "
+            "show up in Roll Back World... marked MCSM.",
         ]
-        matching = next((p for p in providers if p.key == convention.provider), None)
-        if matching is not None:
-            # Mimicry means their retention counts ours. Say so before the
-            # user relies on this archive being there next month.
-            note = matching.retention or "its own retention policy"
-            lines += ["",
-                      f"This follows {matching.name}'s naming, so it will sit "
-                      f"alongside its archives -- and {note} applies to this one too."]
         run = check_server_running(info)
         if run.is_running:
             lines += ["", f"WARNING: {run.reason}",
@@ -897,21 +890,19 @@ class App(tk.Tk):
         if not messagebox.askyesno("Roll Back World", "\n".join(lines)):
             return False
 
-        safety_dir = resolve_backup_convention(info, "safety").directory
+        backup_dir = resolve_backup_convention(info).directory
         safety = messagebox.askyesnocancel(
-            "Safety Backup",
+            "Back Up First",
             "Back up the current world first?\n\n"
             "Strongly recommended -- without it the current world cannot be "
             f"recovered after this restore.\n\n"
-            f"It goes to {safety_dir}, which is ours alone: unlike a normal "
-            "backup it does not follow the installed tool's naming, so that "
-            "tool's retention can never prune it.")
+            f"It goes to {backup_dir} like any other backup we take, and no "
+            "other backup tool writes to or prunes that folder.")
         if safety is None:
             return False
         if safety:
             if not self._run_blocking_backup(
-                    info, "Safety Backup", "Backing up the current world...",
-                    purpose="safety"):
+                    info, "Backing Up", "Backing up the current world..."):
                 return False
         elif not messagebox.askyesno(
             "No Safety Backup",
@@ -987,8 +978,8 @@ class App(tk.Tk):
                     self.on_select_server(None)
                 break
 
-    def _run_blocking_backup(self, info: ServerInfo, title: str, message: str,
-                             purpose: str = "manual") -> bool:
+    def _run_blocking_backup(self, info: ServerInfo, title: str,
+                             message: str) -> bool:
         """Take a backup on a worker thread while pumping the event loop, and
         return whether it succeeded.
 
@@ -1001,7 +992,7 @@ class App(tk.Tk):
 
         def worker():
             try:
-                create_world_backup(info, purpose=purpose,
+                create_world_backup(info,
                                     progress_cb=lambda n, name: progress_state
                                     .__setitem__("text", f"{n} files -- {name[:44]}"),
                                     cancel_event=cancel_event)

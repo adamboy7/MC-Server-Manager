@@ -197,12 +197,8 @@ def _download(
     this is what makes a second install of the same version take seconds, and
     what makes a cancelled asset download resumable.
     """
-    if os.path.exists(dest):
-        if sha1:
-            if _sha1_file(dest) == sha1:
-                return dest
-        elif size is None or os.path.getsize(dest) == size:
-            return dest
+    if _already_have(dest, sha1, size):
+        return dest
 
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     # Unique per call: the asset pass runs sixteen of these at once and two
@@ -238,8 +234,31 @@ def _download(
         _quiet_remove(tmp)
         raise ProviderError(f"Size mismatch downloading {os.path.basename(dest)}.")
 
-    os.replace(tmp, dest)
+    try:
+        os.replace(tmp, dest)
+    except PermissionError:
+        # Windows fails the replace with ERROR_SHARING_VIOLATION when anything
+        # else has `dest` open -- another worker hardlinking it out of the
+        # shared asset store, a second copy of the app, a virus scanner that
+        # got there first. Everything this function writes is verified against
+        # a hash or a size, so a destination that is already correct *is* the
+        # file we just fetched and there is nothing worth replacing.
+        if not _already_have(dest, sha1, size):
+            raise
+        _quiet_remove(tmp)
     return dest
+
+
+def _already_have(path: str, sha1: Optional[str], size: Optional[int]) -> bool:
+    """True when `path` is already the file we were about to download."""
+    try:
+        if not os.path.exists(path):
+            return False
+        if sha1:
+            return _sha1_file(path) == sha1
+        return size is None or os.path.getsize(path) == size
+    except OSError:
+        return False
 
 
 def _quiet_remove(path: str) -> None:
@@ -1697,38 +1716,56 @@ class DecompiledProvider:
 
         objects = index.get("objects", {})
         store = _cache_dir("assets", "objects")
+
+        # One unit of work per distinct hash, not per name. Mojang's indexes
+        # reuse the same object under several names -- 1.21 has 23 such pairs,
+        # and `random/orb.ogg` and `random/successful_hit.ogg` sit three
+        # entries apart, so with sixteen workers they are always in flight
+        # together. Two of them filling the same content-addressed path is what
+        # made Windows fail the replace with a sharing violation; grouping
+        # first means one worker owns a given file, and the duplicate names are
+        # just extra links off the one download.
+        groups: dict[str, list[str]] = {}
+        sizes: dict[str, Optional[int]] = {}
+        for name, info in objects.items():
+            digest = info["hash"]
+            groups.setdefault(digest, []).append(name)
+            sizes.setdefault(digest, info.get("size"))
+
         total = len(objects)
         done = 0
+        next_report = 40
         lock = threading.Lock()
         failures: list[str] = []
 
         def one(item) -> None:
-            nonlocal done
-            name, info = item
+            nonlocal done, next_report
+            digest, names = item
             check_cancelled(cancel)
-            digest = info["hash"]
             sub = digest[:2]
             cached = os.path.join(store, sub, digest)
             try:
                 _download(
                     f"{RESOURCES_BASE}/{sub}/{digest}", cached,
-                    sha1=digest, size=info.get("size"), cancel=cancel,
+                    sha1=digest, size=sizes.get(digest), cancel=cancel,
                 )
             except Cancelled:
                 raise
             except ProviderError as exc:
                 with lock:
-                    failures.append(f"{name}: {exc}")
+                    failures.extend(f"{n}: {exc}" for n in names)
                 return
             _link_or_copy(cached, os.path.join(assets_dir, "objects", sub, digest))
-            # Pre-1.7 clients read loose files by name instead of by hash.
-            if index.get("virtual"):
-                _link_or_copy(cached, os.path.join(assets_dir, "virtual", index_id, *name.split("/")))
-            if index.get("map_to_resources"):
-                _link_or_copy(cached, os.path.join(run_dir, "resources", *name.split("/")))
+            for name in names:
+                # Pre-1.7 clients read loose files by name instead of by hash.
+                if index.get("virtual"):
+                    _link_or_copy(cached, os.path.join(assets_dir, "virtual", index_id, *name.split("/")))
+                if index.get("map_to_resources"):
+                    _link_or_copy(cached, os.path.join(run_dir, "resources", *name.split("/")))
             with lock:
-                done += 1
-                if progress and done % 40 == 0:
+                done += len(names)
+                if progress and done >= next_report:
+                    next_report = done + 40
                     progress(
                         STAGE_DOWNLOAD, done, total,
                         f"Downloading assets... ({done:,}/{total:,})",
@@ -1737,7 +1774,7 @@ class DecompiledProvider:
         if progress:
             progress(STAGE_DOWNLOAD, 0, total, f"Downloading {total:,} assets...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-            list(pool.map(one, objects.items()))
+            list(pool.map(one, groups.items()))
 
         if failures:
             raise ProviderError(

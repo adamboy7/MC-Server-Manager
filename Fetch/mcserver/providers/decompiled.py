@@ -1447,10 +1447,19 @@ class DecompiledProvider:
                     "--in-jar", raw_jar,
                     "--out-jar", target + ".part",
                     "--srg-in", tsrg,
-                    # Mojang's mappings say nothing about local variables, and
-                    # stale LVT entries make the decompiler invent names that
-                    # collide with fields. Dropping the table is cleaner.
-                    "--kill-lvt",
+                    # Deliberately no --kill-lvt. Mojang's obfuscated jars keep
+                    # both the LocalVariableTable and the LocalVariableTypeTable,
+                    # and the type table is the only place a local's *generic*
+                    # type survives -- erase it and
+                    #     Map.Entry<K, V> e = it.next();
+                    # comes back out of the decompiler as
+                    #     Object var0 = it.next();
+                    # so every call made on it fails to compile. The same table
+                    # carries the parameter names the decompiler matches against
+                    # a record's components; without them it writes out an
+                    # explicit canonical constructor it has no business writing.
+                    # On 1.21.11 that was 1,664 of 6,622 files failing to
+                    # compile; keeping the table takes it to 214.
                 ],
                 cancel=cancel, what="SpecialSource",
             )
@@ -1518,7 +1527,13 @@ class DecompiledProvider:
             # Fernflower-inherited switches Vineflower still honours. Generics
             # on and synthetics hidden is what makes the output look like source
             # rather than bytecode transcribed into Java.
-            "-dgs=1", "-asc=1", "-lit=1", "-hes=0", "-hdc=0", "-log=WARN",
+            #
+            # -hes and -hdc stay at their defaults (hide). Printing the empty
+            # `super();` is not merely noise: inside a record's canonical
+            # constructor an explicit constructor invocation is a compile error,
+            # and Vineflower emits one for every record it cannot fold away --
+            # 449 files on the 1.21.11 client.
+            "-dgs=1", "-asc=1", "-lit=1", "-log=WARN",
         ]
         argv += [f"-e={lib}" for lib in lib_jars]
         argv += [jar, src_dir]
